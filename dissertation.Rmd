@@ -1,0 +1,76 @@
+---
+title: "dissertation"
+author: "Jung"
+output: html_document
+---
+
+```{r setup}
+rm(list=ls())
+library(knitr)
+library(dplyr)
+library(stringr)
+library(rbenchmark)
+# Download Forms 10-K/10 Q from SEC
+library(edgar)
+# For sentiment datasets
+library(data.table)
+library(RSQLite)
+library(parallel)
+library(doSNOW)
+library(sentimentr)
+library(quanteda)
+library(tidytext)
+library(textstem)
+library(rvest)
+library(ggplot2)
+library(tidyr)
+library(reshape2)
+library(OpenImageR)
+
+# part B
+library(tidyquant)
+library(tm)
+library(SentimentAnalysis)
+
+# part C
+library(koRpus)
+library(stm)
+```
+
+
+```{r custom function}
+# make progress bar 
+optionSnow <- function (iterations) {
+  i <- iterations
+  pb <- txtProgressBar(max = i, style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+  return(opts)
+}
+
+# fetch data from back up database
+loaddf <- function (dbname, dfname) {
+  con <- dbConnect(RSQLite::SQLite(), paste0(dbname,".db"))
+  df <- dbGetQuery(con, paste("SELECT * FROM", dfname))
+  return(df)
+  dbDisconnect(con)
+}
+
+# save data to back up database
+backup <- function (dbname, dfname, df) {
+  con <- dbConnect(SQLite(), paste0(dbname, ".db"))
+  dbWriteTable(con, dfname, df, overwrite=TRUE)
+  print(paste("Dataframe", dfname, "has been written to back up database!"))
+  print(dbListTables(con))
+  dbDisconnect(con)
+}
+
+# check the database tables
+dbcheck <- function (dbname) {
+  con <- dbConnect(SQLite(), paste0(dbname, ".db"))
+  print((dbListTables(con)))
+  dbDisconnect(con)
+}
+```
+
+
