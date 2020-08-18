@@ -1,13 +1,6 @@
-<style>
-  .center {
-    display: block;
-    margin-left: auto;
-    margin-right: auto;
-    width: 50%;
-  }
-</style>
-
-<img src="https://upload.wikimedia.org/wikipedia/en/thumb/2/21/Warwick_Business_School_logo.svg/1200px-Warwick_Business_School_logo.svg.png" width="250" height="250" class="center">
+<p align="center">
+  <img src="https://upload.wikimedia.org/wikipedia/en/thumb/2/21/Warwick_Business_School_logo.svg/1200px-Warwick_Business_School_logo.svg.png" width="250" height="250" class="center" />
+</p>
 
 ## Discovering Key Risk and Success Factors of Music Streaming Subscription Management by Analysing App Store Reviews: A Case Study of Tidal Music Streaming Service
 ***by Jung Seok Sung***
