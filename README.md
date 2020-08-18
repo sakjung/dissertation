@@ -1,5 +1,6 @@
-
+<div style="text-align:center">
 <img src="https://upload.wikimedia.org/wikipedia/en/thumb/2/21/Warwick_Business_School_logo.svg/1200px-Warwick_Business_School_logo.svg.png" width="250" height="250" class="center">
+</div>
 
 ## Discovering Key Risk and Success Factors of Music Streaming Subscription Management by Analysing App Store Reviews: A Case Study of Tidal Music Streaming Service
 ***by Jung Seok Sung***
@@ -10,43 +11,41 @@ Within the intensively competitive global music streaming market, Tidal has been
 
 ### Table of Contents
 
-Executive Summary	2
-Acknowledgement	2
-1. Introduction	6
-1.1 Background	6
-1.2 Research Questions and Aims	6
-2. Literature Review	8
-2.1 Key Factors of Premium Subscription	8
-2.2 Appstore Reviews Analysis 	9
-3. Research Methodology	10
-3.1 Data Collection	10
-3.2 Data Preparation	12
-3.2.1 Text Cleaning	12
-3.2.2 Tokenisation and Lemmatisation	15
-3.2.3 TF-IDF	15
-3.2.4 Part of Speech (POS) Tagging	16
-3.2.5 Final Data Modification	16
-3.3 Data Analysis	16
-3.3.1 Structural Topic Modelling (STM)	16
-3.3.2 Ranking Model	18
-4. Results	21
-4.1 Top 5 Topics for Apple App Store	21
-4.2 Top 5 Topics for Google Play Store	22
-5. Discussions	23
-5.1 Interpretation of Results	23
-5.1.1 Key Risk Factors	23
-5.1.2 Key Success Factors	25
-5.2 Diagnosis and Recommendations	26
-5.3 Limitations and Future Work	28
-6. Conclusion	29
-
-References	31
-
-Appendix 1 - Topics	33
-Appendix 2 - Topic Ranking (Apple App Store / Risk)	34
-Appendix 3 - Topic Ranking (Apple App Store / Success)	34
-Appendix 4 - Topic Ranking (Google Play Store / Risk)	35
-Appendix 5 - Topic Ranking (Google Play Store / Success)	35
+Executive Summary	2 <br><br> 
+Acknowledgement	2 <br><br>
+1. Introduction	6 <br>
+1.1 Background	6 <br>
+1.2 Research Questions and Aims	6 <br><br>
+2. Literature Review	8 <br>
+2.1 Key Factors of Premium Subscription	8 <br>
+2.2 Appstore Reviews Analysis 9 <br><br>
+3. Research Methodology	10 <br>
+3.1 Data Collection	10 <br>
+3.2 Data Preparation	12 <br>
+3.2.1 Text Cleaning	12 <br>
+3.2.2 Tokenisation and Lemmatisation	15 <br>
+3.2.3 TF-IDF	15 <br>
+3.2.4 Part of Speech (POS) Tagging	16 <br>
+3.2.5 Final Data Modification	16 <br>
+3.3 Data Analysis	16 <br>
+3.3.1 Structural Topic Modelling (STM)	16 <br>
+3.3.2 Ranking Model	18 <br><br>
+4. Results	21 <br>
+4.1 Top 5 Topics for Apple App Store	21 <br>
+4.2 Top 5 Topics for Google Play Store	22 <br><br>
+5. Discussions	23 <br>
+5.1 Interpretation of Results	23 <br>
+5.1.1 Key Risk Factors	23 <br>
+5.1.2 Key Success Factors	25 <br>
+5.2 Diagnosis and Recommendations	26 <br>
+5.3 Limitations and Future Work	28 <br><br>
+6. Conclusion	29 <br><br>
+References	31 <br><br>
+Appendix 1 - Topics	33 <br>
+Appendix 2 - Topic Ranking (Apple App Store / Risk)	34 <br>
+Appendix 3 - Topic Ranking (Apple App Store / Success)	34 <br>
+Appendix 4 - Topic Ranking (Google Play Store / Risk)	35 <br>
+Appendix 5 - Topic Ranking (Google Play Store / Success)	35 <br>
 
 ------
 
