@@ -12,5 +12,5 @@ Within the intensively competitive global music streaming market, Tidal has been
 -------
 
 Skill Set: Data Crawling/Scraping, Data Engineering, Text Pre-Processing Techniques, Structural Topic Modelling, Mathematical Algorithms<br>
-**Full texts available - Dissertation.docx**
+**Full texts available - Dissertation.pdf**
 
