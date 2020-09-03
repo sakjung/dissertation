@@ -1,0 +1,2800 @@
+---
+title: "airbnb report"
+output:
+  word_document: default
+  html_document: default
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding,
+  output_dir = "output", output_format = "all") })
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+```{r global setting, include=FALSE}
+knitr::opts_chunk$set(eval=FALSE)
+```
+
+```{r libraries, eval=FALSE, include=FALSE}
+rm(list=ls())
+library(rvest)
+library(tidyr)
+library(dplyr)
+library(pryr)
+library(data.table)
+library(RSQLite)
+library(foreach)
+library(doParallel)
+library(rbenchmark)
+library(tidytext)
+library(cld3)
+library(qdap)
+library(tm)
+library(wordcloud)
+library(igraph)
+library(ggplot2)
+library(tokenizers)
+library(udpipe)
+library(stm)
+library(anacor)
+library(stargazer)
+library(pscl)
+```
+
+# Data Preparation
+
+```{r custom function}
+# fetch data from back up database
+loaddf <- function (cityname, dfname) {
+  con <- dbConnect(RSQLite::SQLite(), paste0(cityname,".sqlite"))
+  df <- dbGetQuery(con, paste("SELECT * FROM", dfname))
+  return(df)
+  dbDisconnect(con)
+}
+
+# save data to back up database
+backup <- function (cityname, dfname, df) {
+  con <- dbConnect(SQLite(), paste0(cityname, ".sqlite"))
+  dbWriteTable(con, dfname, df, overwrite=TRUE)
+  print(paste("Dataframe", dfname, "has been written to back up database!"))
+  print(dbListTables(con))
+  dbDisconnect(con)
+}
+
+# check the database tables
+dbcheck <- function (cityname) {
+  con <- dbConnect(SQLite(), paste0(cityname, ".sqlite"))
+  print((dbListTables(con)))
+  dbDisconnect(con)
+}
+```
+
+```{r preparing for downloading}
+airbnb_url <- "http://insideairbnb.com/get-the-data.html"
+
+airbnb_html <- read_html(airbnb_url)
+
+# have a look what cities there are
+city_country <- airbnb_html %>%
+  html_nodes("h2") %>%
+  html_text() %>%
+  trimws(.)
+
+# download whole archive
+# make empty vector
+date_compiled <- vector("character")
+listings_urls <- vector("character")
+calender_urls <- vector("character")
+reviews_urls <- vector("character")
+date_compiled <- vector("character")
+city <- vector("character")
+
+for (table in 1:length(city_country)) {
+  
+  all_urls <- airbnb_html %>%
+    html_nodes("tbody") %>%
+    .[table] %>%
+    html_nodes("a") %>%
+    html_attr("href")
+  
+  texts <- airbnb_html %>%
+      html_nodes("tbody") %>%
+      .[table] %>%
+      html_nodes("td") %>%
+      html_text() %>%
+      trimws(.)
+  
+  # what we need -> x = 1 (date compiled) / x = 2 (city)
+  get_text <- function (x, texts) {
+    # extract "x"th column of the table
+    variable_all <- texts[which(1:length(texts) %% 4 == x)]
+    # find out the index to cut by 7 rows
+    variable_index <- seq_along(variable_all) %% 7
+    # extract the first row of the "x"th colmn eventually
+    # it can be any row out of 7 but I just chose first row
+    this_variable <- variable_all[which(variable_index == 1)]
+    return(this_variable)
+  }
+  
+  # there are 7 files per compilation - we need first three files (csv.gz files) 
+  
+  number_of_compilation <- length(all_urls)
+  
+  # retrieve texts we need 
+  this_date_compiled <- get_text(1, texts)
+  this_city <- get_text(2, texts)
+  
+  # retrieve urls we need
+  this_listings_urls <- all_urls[which(1:number_of_compilation %% 7 == 1)]
+  
+  this_calender_urls <- all_urls[which(1:number_of_compilation %% 7 == 2)]
+
+  this_reviews_urls <- all_urls[which(1:number_of_compilation %% 7 == 3)] 
+  
+  # fill in empty vectors with retrieved data
+  city <- append(city, this_city)
+  date_compiled <- append(date_compiled, this_date_compiled)
+  listings_urls <- append(listings_urls, this_listings_urls)
+  calender_urls <- append(calender_urls, this_calender_urls)
+  reviews_urls <- append(reviews_urls, this_reviews_urls)
+}
+# make dataframe with the vectors
+airbnb_dataframe <- data.frame(date_compiled = date_compiled,
+                               city = city,
+                               listings_urls = listings_urls,
+                               calender_urls = calender_urls,
+                               reviews_urls = reviews_urls,
+                               stringsAsFactors = F)
+# change data type of date coulmn to date 
+airbnb_dataframe$date_compiled <- lubridate::dmy(airbnb_dataframe$date_compiled)
+
+# remove all except airbnb_dataframe
+rm(list=setdiff(ls(), "airbnb_dataframe"))
+# clean garbage for memory retain
+gc()
+```
+
+```{r downloading files}
+# create folder to download all files
+dir.create("csv_gz_files")
+
+# downloading files
+for (i in 1:nrow(airbnb_dataframe)) {
+  
+  cityname <- airbnb_dataframe$city[i]
+  date <- airbnb_dataframe$date_compiled[i]
+  
+  # split the urls strings by "/" and pick first element
+  split_elements_listings <- strsplit(airbnb_dataframe$listings_urls[i], split = "/")[[1]]
+  split_elements_calender <- strsplit(airbnb_dataframe$calender_urls[i], split = "/")[[1]]
+  split_elements_reviews <- strsplit(airbnb_dataframe$reviews_urls[i], split = "/")[[1]]
+  
+  # make our own file name with date and the end of real file name (~.csv.gz) 
+  file_name_listings <- paste0(date,"_",split_elements_listings[length(split_elements_listings)])
+  file_name_calender <- paste0(date,"_",split_elements_calender[length(split_elements_calender)])
+  file_name_reviews <- paste0(date,"_",split_elements_reviews[length(split_elements_reviews)])
+  
+  # if there is no folder for a city
+  # make one
+  if (dir.exists(paste0("csv_gz_files/",cityname)) == FALSE) {
+  dir.create(paste0("csv_gz_files/",cityname))
+  }
+#  dir.create(paste0("csv_gz_files/",cityname,"/",date))
+  
+  # downloading required files: listings, calender and reviews
+  # trycatch run the code regardless of errors
+  tryCatch(
+        {
+          message("Downloading the listings file...")
+          download.file(airbnb_dataframe$listings_urls[i], destfile = paste0("csv_gz_files/",cityname,"/",file_name_listings)) 
+        },
+        error=function(cond) {
+            message(paste("URL does not seem to exist:", airbnb_dataframe$listings_urls[i]))
+            message("This is the original error message:")
+            message(cond)
+        },
+        # message after downloading
+        finally={
+            message(paste("Processed URL:", airbnb_dataframe$listings_urls[i]))
+        }
+    )
+  tryCatch(
+        {
+          message("Downloading the calneder file...")
+          download.file(airbnb_dataframe$calender_urls[i], destfile = paste0("csv_gz_files/",cityname,"/",file_name_calender)) 
+        },
+        error=function(cond) {
+            message(paste("URL does not seem to exist:", airbnb_dataframe$calender_urls[i]))
+            message("This is the original error message:")
+            message(cond)
+        },
+        finally={
+            message(paste("Processed URL:", airbnb_dataframe$calender_urls[i]))
+        }
+    )
+  tryCatch(
+        {
+          message("Downloading the reviews file...")
+          download.file(airbnb_dataframe$reviews_urls[i], destfile = paste0("csv_gz_files/",cityname,"/",file_name_reviews)) 
+        },
+        error=function(cond) {
+            message(paste("URL does not seem to exist:", airbnb_dataframe$reviews_urls[i]))
+            message("Here's the original error message:")
+            message(cond)
+        },
+        finally={
+            message(paste("Processed URL:", airbnb_dataframe$reviews_urls[i]))
+        }
+    )
+}
+
+# remove all
+rm(list=ls())
+
+```
+
+We decided to put the all csv.gz files into one big database without any text processing first, in order to keep the pure format of the original files itself. After constructing this main database, we will use this database to extract the data we need to investigate.       
+
+```{r inpect the data}
+# we investigated compiled files in Amsterdam
+# to have a look at the data
+# and figure out what columns we need
+# e.g. using Amsterdam files as follows
+# calendar_df <- fread("csv_gz_files/Amsterdam/2015-04-05_calendar.csv.gz")
+# listings_df <- fread("csv_gz_files/Amsterdam/2015-04-05_listings.csv.gz")
+# reviews_df <- fread("csv_gz_files/Amsterdam/2015-04-05_reviews.csv.gz")
+
+## columns we need:
+# columns we need in calendar
+calendar_col <- c("listing_id", "date", "available", "price", "adjusted_price", 
+                  "minimum_nights", "maximum_nights")
+
+# columns we need in listings
+listings_col <- c("id", "scrape_id", "last_scraped", "name", "summary", "space", "description", "experiences_offered", "neighborhood_overview", "notes", "transit", "host_id", "host_name", "host_since", "host_location", "host_about", "host_response_time", "host_response_rate", "host_acceptance_rate", "host_is_superhost", "host_neighbourhood", "host_listings_count", "host_total_listings_count", "host_verifications", "host_has_profile_pic", "host_identity_verified", "neighbourhood", "neighbourhood_cleansed", "neighbourhood_group_cleansed", "is_location_exact", "property_type", "room_type", "accommodates", "bathrooms", "bedrooms", "beds", "bed_type", "amenities", "square_feet", "price", "weekly_price", "monthly_price", "security_deposit", "cleaning_fee", "guests_included", "extra_people", "minimum_nights", "maximum_nights", "calendar_updated", "has_availability", "availability_30", "availability_60", "availability_90", "availability_365", "number_of_reviews", "first_review", "last_review", "review_scores_rating", "review_scores_accuracy", "review_scores_cleanliness", "review_scores_checkin", "review_scores_communication", "review_scores_location", "review_scores_value", "requires_license", "license", "instant_bookable", "cancellation_policy", "require_guest_profile_picture", "require_guest_phone_verification", "calculated_host_listings_count", "reviews_per_month")
+
+# columns we need in reviews
+reviews_col <- c("listing_id", "id", "date", "reviewer_id", "reviewer_name", "comments")
+
+```
+
+``` {r find the fastest method}
+# tried various methods which seems the most efficient (fastest) 
+# to move csv.gz files to sqlite database
+# using rbenchmark to compare elapsed time between various methods
+# We implemented test on Rscript
+# Actually there are more test codes but this is one part of our benchmark test
+
+# tested with this reviews file
+# read one file to create a table for this test 
+reviews_df <- fread("csv_gz_files/Amsterdam/2015-04-05_reviews.csv.gz")
+
+# made data base in external hard drie due to the size of the data
+airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb_test.sqlite")
+
+reviews_col <- c("listing_id", "id", "date", "reviewer_id", "reviewer_name", "comments")
+# seed to make a table
+reviews_seed <- reviews_df[1]
+# some methods like bulk-insert needs an initial table to insert data in
+# therefore we made an empty table using the seed
+dbCreateTable(airbnb_db, "reviews_test", reviews_seed)
+
+rm(reviews_seed, reviews_df)
+gc()
+print(memory.size())
+
+# bechmark returns a table comparing the codes' efficiencies
+benchmark <- benchmark(
+  
+            cut_by_50000_write = {
+              
+              ## chunk of 500000 to use dbWriteTable function
+              
+              # pick first city
+              this_folder <- list.files("csv_gz_files")[1]
+              # retrieve all files in the city
+              all_files <- list.files(paste0("csv_gz_files/",this_folder))
+              # obtain only reviews files in the city
+              all_files_reviews <- all_files[grepl("reviews",all_files)]
+              
+              # tried only 10 iteration (i.e. 10 review files)
+              for (k in 1:10) {
+                
+                this_reviews <- all_files_reviews[k]
+                
+                print(paste("Reading", this_reviews, "...."))
+                print(memory.size())
+                
+                reviews_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_reviews))
+                
+                # adjusting dataframe according to the fileds in the database table
+                # becuase not all listings files have identical columns
+                # we will extract the columns that we require
+                # which is specified in "reviews_col"
+                # columns not specified in reviews_col will be removed (NULL)
+                # if there is no column required in the reviews file
+                # then we make a new column with NA value
+                col_to_add_rev <- reviews_col[! reviews_col %in% colnames(reviews_df)]
+                col_to_drop_rev <- colnames(reviews_df)[! colnames(reviews_df) %in% reviews_col] 
+                suppressWarnings(reviews_df[, c(col_to_drop_rev) := NULL])
+                suppressWarnings(reviews_df[, col_to_add_rev] <- NA)
+                
+                # make chunk for the reviews file
+                reviews_chunks <- split(reviews_df, (seq(nrow(reviews_df))-1) %/% 50000)
+                # dbWriteTable on the reviews_chunks
+                lapply(reviews_chunks, function(chunk) dbWriteTable(airbnb_db, "reviews_test", chunk, append = TRUE))
+                
+                rm(reviews_df, reviews_chunks)
+                gc()
+                print(memory.size())
+              }
+            },
+            cut_by_50000_insert = {
+              
+              ## chunk of 500000 to use bulk-insert method
+              
+              # make only one transaction which will save time for inserting data
+              dbBegin(airbnb_db)
+              
+              this_folder <- list.files("csv_gz_files")[1]
+              all_files <- list.files(paste0("csv_gz_files/",this_folder))
+              all_files_reviews <- all_files[grepl("reviews",all_files)]
+              
+              for (k in 1:10) {
+                
+                this_reviews <- all_files_reviews[k]
+                
+                print(paste("Reading", this_reviews, "...."))
+                print(memory.size())
+                
+                reviews_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_reviews))
+                
+                # adjusting dataframe according to the fileds in the database table
+                col_to_add_rev <- reviews_col[! reviews_col %in% colnames(reviews_df)]
+                col_to_drop_rev <- colnames(reviews_df)[! colnames(reviews_df) %in% reviews_col] 
+                suppressWarnings(reviews_df[, c(col_to_drop_rev) := NULL])
+                suppressWarnings(reviews_df[, col_to_add_rev] <- NA)
+                
+                reviews_chunks <- split(reviews_df, (seq(nrow(reviews_df))-1) %/% 50000)
+                # bulk inserting on the reviews_chunks
+                lapply(reviews_chunks, function(chunk) {
+                q <- dbSendQuery(airbnb_db, 'INSERT INTO reviews_test (listing_id, id, date, reviewer_id, reviewer_name, comments) 
+                          VALUES (:listing_id, :id, :date, :reviewer_id, :reviewer_name, :comments);', chunk)
+                # clear query results
+                dbClearResult(q)
+                })
+                
+                rm(reviews_df, reviews_chunks)
+                gc()
+                print(memory.size())
+              }
+              # finish transaction
+              dbCommit(airbnb_db)
+            },
+            dbwritetable = {
+              
+              ## dbwritetable function without chunk
+              
+              this_folder <- list.files("csv_gz_files")[1]
+              all_files <- list.files(paste0("csv_gz_files/",this_folder))
+              all_files_reviews <- all_files[grepl("reviews",all_files)]
+              
+              for (k in 1:10) {
+                
+                this_reviews <- all_files_reviews[k]
+                
+                print(paste("Reading", this_reviews, "...."))
+                print(memory.size())
+                
+                reviews_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_reviews))
+                
+                # adjusting dataframe according to the fileds in the database table
+                col_to_add_rev <- reviews_col[! reviews_col %in% colnames(reviews_df)]
+                col_to_drop_rev <- colnames(reviews_df)[! colnames(reviews_df) %in% reviews_col] 
+                suppressWarnings(reviews_df[, c(col_to_drop_rev) := NULL])
+                suppressWarnings(reviews_df[, col_to_add_rev] <- NA)
+                
+                dbWriteTable(airbnb_db, "reviews_test", reviews_df, append = TRUE))
+                
+                rm(reviews_df)
+                gc()
+                print(memory.size())
+              }
+            },
+            bulk_insert = {
+            
+            ## bulk_insert method without chunk  
+              
+            dbBegin(airbnb_db)  
+              
+            this_folder <- list.files("csv_gz_files")[1]
+            all_files <- list.files(paste0("csv_gz_files/",this_folder))
+            all_files_reviews <- all_files[grepl("reviews",all_files)]
+            
+            for (k in 1:10) {
+              
+              this_reviews <- all_files_reviews[k]
+              
+              print(paste("Reading", this_reviews, "...."))
+              print(memory.size())
+              
+              reviews_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_reviews))
+              
+              # adjusting dataframe according to the fileds in the database table
+              col_to_add_rev <- reviews_col[! reviews_col %in% colnames(reviews_df)]
+              col_to_drop_rev <- colnames(reviews_df)[! colnames(reviews_df) %in% reviews_col] 
+              suppressWarnings(reviews_df[, c(col_to_drop_rev) := NULL])
+              suppressWarnings(reviews_df[, col_to_add_rev] <- NA)
+              
+              
+              q <- dbSendQuery(airbnb_db, 'INSERT INTO reviews_test (listing_id, id, date, reviewer_id, reviewer_name, comments) 
+                          VALUES (:listing_id, :id, :date, :reviewer_id, :reviewer_name, :comments);', reviews_df)
+              
+              dbClearResult(q)
+              
+              rm(reviews_df)
+              gc()
+              print(memory.size())
+            }
+            dbCommit(airbnb_db)
+          },
+          replications = 1
+)
+
+# remove relevant data (e.g. db file) after the tests
+# dbDisconnect(airbnb_db_test)
+# unlink("D:\\airbnb\\airbnb_test.sqlite")
+
+# the result shows that bulk_insert has the best performance
+# we will use bulk_insert method to export csv.gz files to sqlite database
+
+# Since the amount of data is too large,
+# we devided the whole procedures into three (listings, reviews, calendar)
+# to process separtely
+# the follwing three chunks are the three processes
+```
+
+```{r listings to db}
+# copy whole chunk to Rscript or use shell to run
+# when laptop is not in use (e.g. before sleep)
+
+library(dplyr)
+library(data.table)
+library(RSQLite)
+
+listings_df <- fread("csv_gz_files/Amsterdam/2015-04-05_listings.csv.gz")
+
+listings_col <- c("id", "scrape_id", "last_scraped", "name", "summary",
+                  "space", "description", "experiences_offered", "neighborhood_overview",
+                  "notes", "transit", "host_id", "host_name", "host_since", "host_location", 
+                  "host_about", "host_response_time", "host_response_rate",
+                  "host_acceptance_rate", "host_is_superhost", "host_neighbourhood",
+                  "host_listings_count", "host_total_listings_count", "host_verifications",
+                  "host_has_profile_pic", "host_identity_verified", "neighbourhood",
+                  "neighbourhood_cleansed", "neighbourhood_group_cleansed", 
+                  "is_location_exact", "property_type", "room_type", "accommodates", 
+                  "bathrooms", "bedrooms", "beds", "bed_type", "amenities", "square_feet", 
+                  "price", "weekly_price", "monthly_price", "security_deposit", 
+                  "cleaning_fee", "guests_included", "extra_people", "minimum_nights",
+                  "maximum_nights", "calendar_updated", "has_availability", 
+                  "availability_30", "availability_60", "availability_90", "availability_365",
+                  "number_of_reviews", "first_review", "last_review", "review_scores_rating",
+                  "review_scores_accuracy", "review_scores_cleanliness",
+                  "review_scores_checkin", "review_scores_communication", 
+                  "review_scores_location", "review_scores_value", "requires_license",
+                  "license", "instant_bookable", "cancellation_policy", 
+                  "require_guest_profile_picture", "require_guest_phone_verification",
+                  "calculated_host_listings_count", "reviews_per_month")
+
+listings_seed <- as_tibble(listings_df)[1, listings_col]
+
+rm(listings_df)
+gc()
+print(memory.size())
+
+airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb.sqlite")
+
+# create table for bulk_insert
+dbCreateTable(airbnb_db, "listings", listings_seed)
+
+rm(listings_seed)
+gc()
+print(memory.size())
+
+for (i in 1:length(list.files("csv_gz_files"))) {
+  
+  # folder structure - csv_gz_files/cityname
+  
+  # find out all files in a city folder 
+  this_folder <- list.files("csv_gz_files")[i]
+  all_files <- list.files(paste0("csv_gz_files/",this_folder))
+  
+  # pass an empty folder to move on to the next iteration directly
+  if (length(all_files) == 0) {
+    print (paste(this_folder, ": this folder is empty")) ; next
+  }
+  
+  # extract only listings files in the folder
+  all_files_listings <- all_files[grepl("listings",all_files)]
+  
+  # one db transaction per city
+  dbBegin(airbnb_db)
+  
+  for (k in 1:length(all_files_listings)) {
+    
+    this_listings_file <- all_files_listings[k]
+    print(paste("Reading", this_folder, this_listings_file, "...."))
+    
+    # later use to caclulate elapsed processing time
+    start <- Sys.time()
+    # check memory.size()
+    print(memory.size())
+
+    listings_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_listings_file))
+    
+    # adjusting dataframe according to the fileds in the database table
+    col_to_add_list <- listings_col[! listings_col %in% colnames(listings_df)]
+    col_to_drop_list <- colnames(listings_df)[! colnames(listings_df) %in% listings_col] 
+    suppressWarnings(listings_df[, c(col_to_drop_list) := NULL])
+    suppressWarnings(listings_df[, col_to_add_list] <- NA)
+    
+    q <- dbSendQuery(airbnb_db, 'INSERT INTO listings (id, scrape_id, last_scraped, name, summary,
+                   space, description, experiences_offered, neighborhood_overview,
+                   notes, transit, host_id, host_name, host_since, host_location, 
+                   host_about, host_response_time, host_response_rate,
+                   host_acceptance_rate, host_is_superhost, host_neighbourhood,
+                   host_listings_count, host_total_listings_count, host_verifications,
+                   host_has_profile_pic, host_identity_verified, neighbourhood,
+                   neighbourhood_cleansed, neighbourhood_group_cleansed, 
+                   is_location_exact, property_type, room_type, accommodates, 
+                   bathrooms, bedrooms, beds, bed_type, amenities, square_feet, 
+                   price, weekly_price, monthly_price, security_deposit, 
+                   cleaning_fee, guests_included, extra_people, minimum_nights,
+                   maximum_nights, calendar_updated, has_availability, 
+                   availability_30, availability_60, availability_90, availability_365,
+                   number_of_reviews, first_review, last_review, review_scores_rating,
+                   review_scores_accuracy, review_scores_cleanliness,
+                   review_scores_checkin, review_scores_communication, 
+                   review_scores_location, review_scores_value, requires_license,
+                   license, instant_bookable, cancellation_policy, 
+                   require_guest_profile_picture, require_guest_phone_verification,
+                   calculated_host_listings_count, reviews_per_month) 
+                          VALUES (:id, :scrape_id, :last_scraped, :name, :summary,
+                   :space, :description, :experiences_offered, :neighborhood_overview,
+                   :notes, :transit, :host_id, :host_name, :host_since, :host_location, 
+                   :host_about, :host_response_time, :host_response_rate,
+                   :host_acceptance_rate, :host_is_superhost, :host_neighbourhood,
+                   :host_listings_count, :host_total_listings_count, :host_verifications,
+                   :host_has_profile_pic, :host_identity_verified, :neighbourhood,
+                   :neighbourhood_cleansed, :neighbourhood_group_cleansed, 
+                   :is_location_exact, :property_type, :room_type, :accommodates, 
+                   :bathrooms, :bedrooms, :beds, :bed_type, :amenities, :square_feet, 
+                   :price, :weekly_price, :monthly_price, :security_deposit, 
+                   :cleaning_fee, :guests_included, :extra_people, :minimum_nights,
+                   :maximum_nights, :calendar_updated, :has_availability, 
+                   :availability_30, :availability_60, :availability_90, :availability_365,
+                   :number_of_reviews, :first_review, :last_review, :review_scores_rating,
+                   :review_scores_accuracy, :review_scores_cleanliness,
+                   :review_scores_checkin, :review_scores_communication, 
+                   :review_scores_location, :review_scores_value, :requires_license,
+                   :license, :instant_bookable, :cancellation_policy, 
+                   :require_guest_profile_picture, :require_guest_phone_verification,
+                   :calculated_host_listings_count, :reviews_per_month);', listings_df)
+    
+    dbClearResult(q)
+    
+    print(paste("Moved", this_folder, this_listings_file, "to the listings table"))
+    print(paste("It took", Sys.time()-start, "to process!"))
+    
+    rm(listings_df)
+    gc()
+    print(memory.size())
+  }
+  # End one transaction per city
+  dbCommit(airbnb_db)
+}
+
+dbDisconnect(airbnb_db)
+```
+
+```{r reviews to db}
+# copy whole chunk to Rscript or use shell to run
+# when laptop is not in use (e.g. before sleep)
+# all the description of the codes are identical to the chunks above
+
+library(dplyr)
+library(data.table)
+library(RSQLite)
+
+reviews_df <- fread("csv_gz_files/Amsterdam/2015-04-05_reviews.csv.gz")
+
+reviews_col <- c("listing_id", "id", "date", "reviewer_id", "reviewer_name", "comments")
+reviews_seed <- reviews_df[1]
+
+rm(reviews_df)
+gc()
+print(memory.size())
+
+airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb.sqlite")
+
+dbCreateTable(airbnb_db, "reviews", reviews_seed)
+
+rm(reviews_seed)
+gc()
+print(memory.size())
+
+for (i in 1:length(list.files("csv_gz_files"))) {
+  
+  # folder structure - csv_gz_files/cityname
+  
+  this_folder <- list.files("csv_gz_files")[i]
+  all_files <- list.files(paste0("csv_gz_files/",this_folder))
+  
+  if (length(all_files) == 0) {
+    print (paste(this_folder, ": this folder is empty")) ; next
+  }
+  
+  all_files_reviews <- all_files[grepl("reviews",all_files)]
+  
+  dbBegin(airbnb_db)
+  
+  for (j in 1:length(all_files_reviews)) {
+    
+    this_reviews_file <- all_files_reviews[j]
+    print(paste("Reading", this_folder, this_reviews_file, "...."))
+    print(memory.size())
+    
+    start <- Sys.time()
+    
+    reviews_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_reviews_file))
+    
+    # adjusting dataframe according to the fileds in the database table
+    col_to_add_rev <- reviews_col[! reviews_col %in% colnames(reviews_df)]
+    col_to_drop_rev <- colnames(reviews_df)[! colnames(reviews_df) %in% reviews_col] 
+    suppressWarnings(reviews_df[, c(col_to_drop_rev) := NULL])
+    suppressWarnings(reviews_df[, col_to_add_rev] <- NA)
+    
+    q <- dbSendQuery(airbnb_db, 'INSERT INTO reviews (listing_id, id, date, reviewer_id, reviewer_name, comments) 
+                          VALUES (:listing_id, :id, :date, :reviewer_id, :reviewer_name, :comments);', reviews_df)
+    
+    dbClearResult(q)
+    
+    print(paste("Moved", this_folder, this_reviews_file, "to the reviews table"))
+    print(paste("It took", Sys.time()-start, "to process!"))
+    
+    rm(reviews_df)
+    gc()
+    print(memory.size())
+  }
+  
+  # one transaction per city
+  dbCommit(airbnb_db)
+}
+
+dbDisconnect(airbnb_db)
+```
+
+```{r calendar to db}
+# copy whole chunk to Rscript or use shell to run
+# when laptop is not in use (e.g. before sleep)
+# all the description of the codes are identical to the chunks above
+
+library(dplyr)
+library(data.table)
+library(RSQLite)
+
+calendar_df <- fread("csv_gz_files/Amsterdam/2019-12-07_calendar.csv.gz")
+
+calendar_seed <- calendar_df[1]
+
+rm(calendar_df)
+gc()
+print(memory.size())
+
+
+calendar_col <- c("listing_id", "date", "available", "price", "adjusted_price", 
+                  "minimum_nights", "maximum_nights")
+
+airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb.sqlite")
+
+dbCreateTable(airbnb_db, "calendar", calendar_seed)
+
+rm(calendar_seed)
+gc()
+print(memory.size())
+
+for (i in 1:length(list.files("csv_gz_files"))) {
+  
+  # folder structure - csv_gz_files/cityname
+  
+  this_folder <- list.files("csv_gz_files")[i]
+  all_files <- list.files(paste0("csv_gz_files/",this_folder))
+  
+  if (length(all_files) == 0) {
+    print (paste(this_folder, ": this folder is empty")) ; next
+  }
+  
+  all_files_calendar <- all_files[grepl("calendar",all_files)]
+  
+  dbBegin(airbnb_db)
+  
+  for (j in 1:length(all_files_calendar)) {
+    
+    this_calendar_file <- all_files_calendar[j]
+    print(paste("Reading", this_folder, this_calendar_file, "...."))
+    print(memory.size())
+    
+    start <- Sys.time()
+    
+    calendar_df <- fread(paste0("csv_gz_files/",this_folder,"/",this_calendar_file))
+    
+    # adjusting dataframe according to the fileds in the database table
+    col_to_add_cal <- calendar_col[! calendar_col %in% colnames(calendar_df)]
+    col_to_drop_cal <- colnames(calendar_df)[! colnames(calendar_df) %in% calendar_col] 
+    suppressWarnings(calendar_df[, c(col_to_drop_cal) := NULL])
+    suppressWarnings(calendar_df[, col_to_add_cal] <- NA)
+    
+    q <- dbSendQuery(airbnb_db, 'INSERT INTO calendar (listing_id, date, available, price, 
+    adjusted_price, minimum_nights, maximum_nights) 
+                          VALUES (:listing_id, :date, :available, :price, :adjusted_price, 
+      :minimum_nights, :maximum_nights);', calendar_df)
+    
+    dbClearResult(q)
+    
+    print(paste("Moved", this_folder, this_calendar_file, "to the calendar table"))
+    print(paste("It took", Sys.time()-start, "to process!"))
+    
+    rm(calendar_df)
+    gc()
+    print(memory.size())
+  }
+  
+  # one transaction per city
+  dbCommit(airbnb_db)
+}
+
+dbDisconnect(airbnb_db)
+```
+
+We will now extract the data we need. We are not going to run all the cities, but all the codes and process in this report will be applicable to analysis on any city in the database by simply setting the target city name in the code. This is because the methodology and approach will be exactly same to that of ours introduced in this report. 
+
+In order to provide the whole process of anlaysis, **South Aegean, Greece** is chosen as an example country.  We assummed that the most recently compiled listing file contains all the listings in a city. Therefore, we will pull out the data from database using the most recent listing file's scrape id which must be unique. Correspoinding reviews data can then be queried using the unqiue listing_id in the listing data fetched. This listings and reviews can be saved in separted database after some processing for back up. In this way, any city in the database can be investigated efficiently.
+
+```{r create index on database}
+# we chose to analayse south_aegean
+# which has relatively small amount of data
+# the codes can be applicable to all cities in the db 
+# by changing the cityname variable
+airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb.sqlite")
+
+# create index for scrape_id and listing_id for fast query
+# this saves time for a big database query
+dbSendQuery(airbnb_db, "CREATE INDEX scrape_id ON listings (scrape_id)")
+dbSendQuery(airbnb_db, "CREATE INDEX listing_id ON reviews (listing_id)")
+```
+
+```{r data prepartion}
+# specify the folder name of the city we want to investigate
+cityname_folder <- "South Aegean"
+
+# use this function to get scrape id
+# of the target city 
+get_scrapeid <- function (cityname_folder) {
+  
+  # find out the most recent data compiled date 
+  # which is located at the end of the file list
+  # as files are arranged in the order of date (oldest to latest)
+  most_recent_listings_date <- strsplit(list.files(paste0("csv_gz_files/",cityname_folder)), 
+                                      split = "_")[[length(list.files(paste0("csv_gz_files/",cityname_folder)))]][1]
+  # we assumed that the most recent listings 
+  # contain all the listings information of a city
+  # we will use scrape_id of the most recently compiled listings file
+  # to find nad extract (query) the most recent listings file 
+  # from the data base
+  most_recent_listings <- fread(paste0("csv_gz_files/",cityname_folder,"/",most_recent_listings_date, "_listings.csv.gz"))
+  scrape_id <- as.character(unique(most_recent_listings$scrape_id))
+  return(scrape_id)
+}
+
+scrape_id <- get_scrapeid(cityname_folder)
+
+# query for the most recent listings data
+query_listings <- paste0("SELECT * FROM listings WHERE scrape_id = ",scrape_id)
+listings_df <- dbGetQuery(airbnb_db, query_listings)
+listings_df <- south_aegean_listings %>% rename(listing_id = id)
+rm(most_recent_listings)
+gc()
+
+# check the listing id in the most recent listings data
+# use this id to extract reviews data we need from the database
+listing_id <- unique(listings_df$listing_id)
+
+# qeury for the reviews we need 
+query_reviews <- paste0("SELECT * FROM reviews WHERE listing_id IN (", paste(listing_id, collapse = ', ') ,")")
+res <- dbSendQuery(airbnb_db, query_reviews)
+
+# queried reviews data has very large size
+# this may be because the review files are cumulative files
+# However, we are not sure exactly which review file contains which reviews
+# therefore, we will process all the reviwes data satisfy the query
+# and then remove duplicate reviews
+
+# we require parallel processing for faster process 
+# we will make (number of cores - 1) workers to work parallel on this
+# to pre-process on the reviews data and save it in a new database
+# for further analysis
+
+# making clusters (workers) for parallel processing
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+# prepare libraries required in the parallel processing
+clusterEvalQ(cl, {
+  library(tidytext)
+  library(cld2)
+  library(dplyr)
+})
+
+# make new db for anlaysis
+# as it is difficult to handle whole data of one city in R session
+# we save required data in this database and extract it when we need (back up)
+
+# set cityname!
+cityname <- "south_aegean"
+# make new dataframe
+# to backup some important data during the whole analysis
+con <- dbConnect(RSQLite::SQLite(), paste0(cityname,".sqlite"))
+
+# set the adequate chunk size according to the query size 
+split_size <- 20000
+
+# while loop until the res (query on reviews) is completed 
+while (!dbHasCompleted(res)) {
+  
+  # query chunk of 500000 for query
+  # size can be changed according to the size of the data
+  south_aegean_reviews <- dbFetch(res, 500000)
+  print(paste("Fetched", nrow(south_aegean_reviews), "rows from reviews table"))
+  total_number_of_chunks <- ceiling(nrow(south_aegean_reviews)/split_size)
+  
+  south_aegean_reviews <- south_aegean_reviews %>% rename(review_id = id)
+  
+  print("Start parallel processing...")
+  
+  # parallel processing to combine listings and reviews + pre process of the text
+  all_data_list <- foreach(i=1:total_number_of_chunks) %dopar% {
+    
+    # allocate the start row and last row
+    # to cut the queried data accordingly
+    if (i == 1){
+      this_start_row <- i 
+      this_last_row <- i*split_size
+    } else {
+      this_start_row <- (i-1)*split_size+1
+      this_last_row <- i*split_size
+    }
+    
+    # combine listings and reviews
+    all_data_df <- south_aegean_listings %>% 
+      left_join(south_aegean_reviews[this_start_row:this_last_row, ])
+    
+    # drop NA value -> nchar for review length -> left right trim
+    all_data_df <- all_data_df[!is.na(all_data_df$comments), ]
+    all_data_df$review_length_chars <- nchar(all_data_df$comments)
+    all_data_df <- all_data_df %>% 
+      filter(review_length_chars > 144, review_length_chars < 1000)
+    
+    # language detection with cld2 
+    # which captured less english texts in our test
+    all_data_df <- all_data_df %>% 
+      mutate(review_language = cld2::detect_language(comments))
+    all_data_df <- all_data_df %>% 
+      filter(review_language == "en")
+    
+    # remove digit and punctuation
+    all_data_df$comments <- gsub('[[:digit:]]+',' ', all_data_df$comments)
+    all_data_df$comments <- gsub('[[:punct:]]+',' ', all_data_df$comments)
+    
+    return(all_data_df)
+  }
+  
+  print("Finished this parallel processing!")
+  
+  df <- rbindlist(all_data_list)
+
+  dbWriteTable(con, "all_data", df, append = TRUE)
+  
+  rm(df)
+  gc()
+  print("Finished moving data to Database!")
+}
+
+# stop the cluster (no parallel)
+stopCluster(cl)
+rm(cl, south_aegean_listings, south_aegean_reviews, all_data_list)
+dbClearResult(res)
+dbDisconnect(airbnb_db)
+rm(airbnb_db, res)
+gc()
+
+# check whether the table is saved
+dbListTables(con)
+
+# reviews of whole archive can contain duplicate reviews as mentioned above
+# parallel processing did not deal with it
+# we have to extract only unique reviews from the processed all_data
+all_data <- dbGetQuery(con, "SELECT * FROM all_data")
+all_data <- all_data[!duplicated(all_data$review_id),]
+
+# remove listings which has less than 4 reviews
+to_remove_listing_ids <- all_data %>% 
+  group_by(listing_id) %>% 
+  summarise(total = n()) %>% 
+  filter(total <= 3) %>% 
+  pull(listing_id)
+
+all_data <- all_data %>% 
+                 filter(!(listing_id %in% to_remove_listing_ids))
+
+# back up
+backup(cityname, "all_data", all_data)
+```
+
+```{r}
+#  stop words
+data("stop_words")
+stop_words <- rbind(stop_words,tibble(word=c(gsub("_", " ",cityname),"airbnb"),lexicon="custom"))
+
+# set split_size to make chunks
+split_size <- 10000
+tokens_list <- split(all_data, 
+                     rep(1:ceiling(nrow(all_data)
+                                   /split_size), 
+                         each=split_size,
+                         length.out=nrow(all_data)))
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  library(tidytext)
+  library(dplyr)
+  library(cld2)
+})
+
+tokens_comments_list <- foreach (i=1:length(tokens_list)) %dopar% {
+  
+  # making word tokens upon reviews (comments)
+  tokens_h <- tokens_list[[i]] %>% 
+    unnest_tokens(word,comments) %>%
+    # count number of words per listing_id
+    count(word,listing_id) %>%
+    # remove stop words
+    anti_join(stop_words)
+   
+  return(tokens_h)
+}
+
+stopCluster(cl)
+rm(cl)
+
+# tokens list to dataframe
+tokens_comments <- rbindlist(tokens_comments_list)
+
+# n values could be separted due to parallel batch processing
+# we will sum up the n values with the same combination of word and listing_id
+# so that n value can represent correct amount
+tokens_comments <- tokens_comments %>% group_by(word, listing_id) %>% summarise(n = sum(n)) %>% ungroup()
+
+rm(tokens_list, tokens_comments_list)
+gc()
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+# subset original vector of words 
+# to exclude words with non-ASCII character (non_english character)
+# this can cause duplicate rows by removing non-english words
+# e.g. adaâ	-> ada will become same with the word originally ada 
+# this could generate two duplicate ada rows with same review_id 
+# used normal sapply but if the data is large use parsapply
+comments_only_en <- parSapply(cl = cl, tokens_comments$word, function(row) iconv(row, "latin1", "ASCII", sub=""))
+tokens_comments$word <- comments_only_en
+
+tokens_comments <- tokens_comments %>% 
+  group_by(word, listing_id) %>% 
+  summarise(n = sum(n)) %>% ungroup()
+
+stopCluster(cl)
+rm(comments_only_en)
+gc()
+
+# find out a word with repetitive characters or patterns of characters
+# e.g. aaaa or wowwowwowwow
+customstopwords_comments <- tokens_comments$word[grepl("\\b(\\S+?)\\1\\1\\S*\\b", tokens_comments$word)]
+
+
+# remove useless words
+tokens_comments <- tokens_comments %>% 
+  filter(word != "") %>%
+  filter(!word %in% customstopwords_comments)
+```
+
+```{r}
+##  remove abnormal length of tokens
+tokens_comments$token_length <- nchar(tokens_comments$word)
+    
+View(tokens_comments %>% group_by(token_length) %>% summarise(total =n()))
+
+tokens_comments <- tokens_comments %>% 
+filter(token_length > 2, token_length <= 15)
+
+# back up
+backup(cityname, "tokens_comments", tokens_comments)
+```
+
+```{r tfidfcuttoff}
+# Ok the tfidf is cut 
+# lets try to filter important words 
+# using the left and right trim 
+# we will not use tf_idf method for part A
+
+comments_tokens_all_tf_idf <- tokens_comments %>% 
+  bind_tf_idf(word,listing_id,n)
+
+hist(comments_tokens_all_tf_idf$tf_idf,breaks = 200,main="TF-IDF plot")
+
+comments_tokens_all_tf_idf <- comments_tokens_all_tf_idf %>% 
+  filter(tf_idf<0.1)
+
+hist(comments_tokens_all_tf_idf$tf_idf,breaks = 200,main="TF-IDF plot")
+
+# Ok from the plot we see that the cut-off value 
+comments_tokens_all_tf_idf <- comments_tokens_all_tf_idf %>% 
+  filter(tf_idf<0.01)
+
+hist(comments_tokens_all_tf_idf$tf_idf,breaks = 200,main="TF-IDF plot")
+
+# Lets now remove also very common terms 
+# those with tf-idf <0.001 as shown in the chart below 
+
+comments_tokens_all_tf_idf <- comments_tokens_all_tf_idf %>% 
+  filter(tf_idf>0.0003)
+
+hist(comments_tokens_all_tf_idf$tf_idf,breaks = 200,main="TF-IDF plot")
+```
+
+```{r}
+listings_dtm <- tokens_comments %>% 
+  cast_dtm(listing_id,word,n)
+```
+
+# PART A 
+
+## What are the dominant words per aggregation category (neighborhood, access to public transport etc.)?
+
+We first calculate term frequency on comments and take the top 10 of the most frequent words, then use wordcloud to plot them.
+
+```{r}
+(comments_top10word <- tokens_comments %>% 
+  group_by(word) %>% summarise(total =n()) %>% 
+ arrange(desc(total)) %>% top_n(10))
+
+tokens_comments %>%
+  anti_join(stop_words)%>%
+  count(word)%>%
+  with(wordcloud(word, n, max.words = 10,colors = "orange"))
+```
+**result summary**
+
+|word | total|
+|-----|------|
+|stay	| 8092 |		
+|clean	| 7628 |		
+|location|	7609 |			
+|recommend| 7551 |			
+|nice	| 7395 |		
+|host	| 7284 |		
+|perfect	| 7191|			
+|beautiful| 7178|			
+|helpful	|6916	|		
+|amazing	|6881	|
+
+Then we select to top 5 neighbourhoods, calculate tf_idf's for each neighbourhood as requested, and find the top 5 of the dominant words for each neighbourhood.
+
+```{r sameforothers}
+
+# Lets calculate tf_idf's for 
+# other categories as requested 
+
+# neighbourhood - lets get the 
+# top 5 
+top_5 <- all_data %>% 
+  select(listing_id,neighbourhood_cleansed) %>%
+  unique(.) %>% 
+  group_by(neighbourhood_cleansed) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% 
+  top_n(5)
+
+tokens_top_5 <- all_data %>% 
+  select(listing_id,neighbourhood_cleansed) %>% 
+  filter(neighbourhood_cleansed %in% top_5$neighbourhood_cleansed) %>% 
+  unique(.)
+
+neighbourhood_tokens <- tokens_comments %>% 
+  right_join(tokens_top_5) %>% group_by(neighbourhood_cleansed,word) %>% 
+  summarise(total=sum(n)) %>% 
+  arrange(desc(total))
+
+# Now loop through and get the top 10 tokens 
+# per neighbourhood for the review 
+for(neighb in 1:nrow(top_5)){
+  print(paste0("For neighbourhood: ",top_5$neighbourhood_cleansed[neighb]))
+  
+  toprint <- neighbourhood_tokens %>% ungroup() %>% filter(neighbourhood_cleansed == top_5$neighbourhood_cleansed[neighb]) %>% top_n(10,total) %>% select(-total) %>% mutate(rank = row_number())
+  print(toprint)
+}
+```
+
+**results summary**
+
+|neighbourhood_cleansed      |    word   |   rank |
+|----------------------------|-----------|--------|
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| stay      |1|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| location  |2|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| santorini	|3|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| house     |4|	
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| recommend	|5|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| amazing |6|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| view	   |7|	
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| clean	|8|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| host	|9|		
+|Î\230Î®Ï\201Î±Ï‚ (Santorini)| oia	|10	|
+
+|neighbourhood_cleansed| word |rank|
+|----------------------|------|----|
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|stay	|1|		
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|mykonos	|2|		
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|location|	3	|	
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|town	|4	|	
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|amazing	|5	|	
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|host	|6	|	
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|recommend|	7|		
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|lean	|8	|	
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|view	|9	|	
+|ÎœÏ…ÎºÏŒÎ½Î¿Ï… (Îœykonos)	|house|	10|	
+
+|neighbourhood_cleansed| word |rank|
+|----------------------|------|----|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|stay	|1	|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|apartment|	2|		
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|house	|3		|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|town	|4		|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|nice	|5		|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|rhodes|	6	|	
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|clean	|7		|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|location|	8|		
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|host	|9		|
+|Î¡ÏŒÎ´Î¿Ï… (Rhodes)	|recommend|	10|	
+
+|neighbourhood_cleansed| word |rank|
+|----------------------|------|----|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|stay	|1		|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|paros	|2		|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|house	|3		|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|clean	|4		|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|nice	|5		|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|location|	6	|	
+|Î Î¬Ï\201Î¿Ï… (Paros)	|recommend	|7	|	
+|Î Î¬Ï\201Î¿Ï… (Paros)	|apartment	|8|		
+|Î Î¬Ï\201Î¿Ï… (Paros)	|port	|9		|
+|Î Î¬Ï\201Î¿Ï… (Paros)	|beautiful|	10	|
+
+|neighbourhood_cleansed| word |rank|
+|----------------------|------|----|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|stay	|1		|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|naxos	|2		|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|beach	|3		|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|clean	|4		|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|apartment|	5	|	
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|location	|6|		
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|port	|7		|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|recommend|	8|		
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|nice	|9		|
+|Î\235Î¬Î¾Î¿Ï… & ÎœÎ¹ÎºÏ\201ÏŽÎ½ ÎšÏ…ÎºÎ»Î¬Î´Ï‰Î½ (Naxos & Small Cyclades)	|town	|10	|
+
+We now analyses dominant words based on access to public transport.
+
+```{r}
+# access to public transport
+# get top 10 frequent words
+# and then exclude non public transport words
+# by adding them into stop words 
+split_size <- 10000
+tokens_list <- split(all_data, 
+                     rep(1:ceiling(nrow(all_data)
+                                   /split_size), 
+                         each=split_size,
+                         length.out=nrow(all_data)))
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  library(tidytext)
+  library(dplyr)
+  library(cld2)
+})
+
+tokens_transit_list <- foreach (i=1:length(tokens_list)) %dopar% {
+  
+  df <- tokens_list[[i]] %>% 
+      mutate(language = cld2::detect_language(all_description))
+    
+  df <- df %>% 
+      filter(language == "en")
+  
+  ##  digit and punctuation
+  df$all_description <- gsub('[[:digit:]]+',' ', df$all_description)
+  df$all_description <- gsub('[[:punct:]]+',' ', df$all_description)
+  
+  tokens_h <- df %>% 
+    unnest_tokens(word,transit) %>%
+    count(word,listing_id) %>%
+    anti_join(stop_words)
+   
+  return(tokens_h)
+}
+
+stopCluster(cl)
+rm(cl)
+
+tokens_transit <- rbindlist(tokens_transit_list)
+
+rm(tokens_transit_list, tokens_list)
+gc()
+
+# sum up duplicate word and listing_id combinations
+tokens_transit <- tokens_transit %>% group_by(word, listing_id) %>% summarise(n = sum(n)) %>% ungroup()
+
+tokens_transit %>% group_by(word) %>% summarise(total =n()) %>% 
+ arrange(desc(total)) %>% top_n(10)
+```
+
+
+```{r}
+# by analysing the initial raw tokens we found that we need some process
+# as there are some noise words not related to the transport
+# let's add stop words first
+stop_words <- rbind(stop_words,tibble(word=c("island","station","minutes","stop"),lexicon="custom"))
+
+completeFun <- function(data, desiredCols) {
+  completeVec <- complete.cases(data[, desiredCols])
+  return(data[completeVec, ])
+}
+
+# remove NA and empty string
+all_data_withoutna_transit <- completeFun(all_data, "transit")
+all_data_withoutna_transit <- all_data_withoutna_transit %>% 
+  filter(transit != "") %>% 
+  select(listing_id, transit) %>%
+  unique(.)
+
+# did not use prallel processing here as the data amount is reduced enough
+# if the data is still big, then use the same parallel processing method above
+
+all_data_withoutna_transit <- all_data_withoutna_transit %>% 
+      mutate(language = cld2::detect_language(transit))
+    
+all_data_withoutna_transit <- all_data_withoutna_transit %>% 
+      filter(language == "en")
+  
+  ##  digit and punctuation
+all_data_withoutna_transit$transit <- gsub('[[:digit:]]+',' ', all_data_withoutna_transit$transit)
+all_data_withoutna_transit$transit <- gsub('[[:punct:]]+',' ', all_data_withoutna_transit$transit)
+
+tokens_transit <- all_data_withoutna_transit %>% 
+    unnest_tokens(word,transit) %>%
+    count(word,listing_id) %>%
+    anti_join(stop_words)
+
+# used normal sapply but if the data is large use parsapply
+only_en <- sapply(tokens_transit$word, function(row) iconv(row, "latin1", "ASCII", sub=""))
+tokens_transit$word <- only_en
+tokens_transit <- tokens_transit %>% 
+  group_by(word, listing_id) %>% 
+  summarise(n = sum(n)) %>% ungroup()
+tokens_transit <- tokens_transit %>% filter(word != "")
+
+# get the top 3 public transport
+(public_transport <- tokens_transit %>% group_by(word) %>% summarise(total =n()) %>% 
+ arrange(desc(total)) %>% top_n(3))
+```
+
+**results summary**
+
+|word |total|
+|-----|:---:|
+|bus	|3068|			
+|car	|2416	|		
+|taxi|	1260|	
+
+We select top 5 property types, calculate tf_idf's for each type, and find the top 10 of the dominant words for each type.
+
+```{r}
+## property type
+
+# lets get the top 5 
+top_5_p <- all_data %>% 
+  select(listing_id,property_type) %>%
+  unique(.) %>% 
+  group_by(property_type) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% 
+  top_n(5)
+
+tokens_top_5_p <- all_data %>% 
+  select(listing_id,property_type) %>% 
+  filter(property_type %in% top_5_p$property_type) %>% 
+  unique(.)
+
+property_tokens <- tokens_comments %>% 
+  right_join(tokens_top_5_p) %>% group_by(property_type,word) %>% 
+  summarise(total=sum(n)) %>% 
+  arrange(desc(total))
+
+# Now loop through and get the top 10 tokens 
+# per property type for the review 
+
+for(prop in 1:nrow(top_5_p)){
+  print(paste0("For propertytype: ",top_5_p$property_type[prop]))
+  
+  toprint_p <- property_tokens %>% ungroup() %>% filter(property_type == top_5_p$property_type[prop]) %>% top_n(10,total) %>% select(-total) %>% mutate(rank = row_number())
+  print(toprint_p)
+}
+
+```
+
+**results summary**
+
+|property_type| word |rank|
+|-------------|-----|----|
+|Apartment	|stay	|1		|
+|Apartment	|apartment|	2	|	
+|Apartment	|location	|3|		
+|Apartment	|clean	|4		|
+|Apartment	|nice	|5		|
+|Apartment	|recommend	|6|		
+|Apartment	|host	|7		|
+|Apartment	|beach	|8		|
+|Apartment	|perfect	|9	|	
+|Apartment	|town	|10	|
+
+|property_type| word |rank|
+|-------------|------|----|
+|Cycladic house (Greece)	|house|	1	|	
+|Cycladic house (Greece)	|stay	|2	|	
+|Cycladic house (Greece)	|location|	3	|	
+|Cycladic house (Greece)	|amazing	|4	|	
+|Cycladic house (Greece)	|beautiful	|5|		
+|Cycladic house (Greece)	|host	|6		|
+|Cycladic house (Greece)	|recommend|	7|		
+|Cycladic house (Greece)	|view	|8		|
+|Cycladic house (Greece)	|perfect	|9|		
+|Cycladic house (Greece)	|clean	|10|		
+
+|property_type| word |rank|
+|-------------|------|----|
+|House	|house|	1		|
+|House	|stay	|2		|
+|House	|location|	3|		
+|House	|view	|4		|
+|House	|recommend	|5|		
+|House	|host	|6		|
+|House	|beautiful	|7|		
+|House	|amazing	|8	|	
+|House	|clean	|9		|
+|House	|perfect	|10|	
+
+|property_type| word |rank|
+|-------------|------|----|
+|Villa	|villa	|1	|	
+|Villa	|stay	|2	|	
+|Villa	|house	|3	|	
+|Villa	|amazing|	4	|	
+|Villa	|view	|5	|	
+|Villa	|beautiful|	6|		
+|Villa	|host	|7	|	
+|Villa	|location	|8	|	
+|Villa	|recommend	|9	|
+|Villa	|clean	|10	|
+
+|property_type| word |rank|
+|-------------|------|----|
+|Condominium|	stay	|1		|
+|Condominium|	clean	|2		|
+|Condominium|	location	|3|		
+|Condominium|	beach	|4		|
+|Condominium|	apartment|	5|		
+|Condominium|	nice	|6		|
+|Condominium|	recommend|	7|		
+|Condominium|	host	|8		|
+|Condominium|	amazing	|9		|
+|Condominium|	beautiful	|10|
+
+## What are the most common word combinations used to describe a property listing?
+
+Based on previous analysis, we found the word recommend and stay are very important. So we try to find associated terms from the document term matrix that we created. 
+
+```{r wordcomb}
+# find association for the word "recommend" using the document term matrix
+assocs_recommend <- findAssocs(listings_dtm,"recommend",corlimit = 0.80)
+
+print(assocs_recommend$recommend)
+
+# find association for the word "recommend" using the document term matrix
+assocs_stay <- findAssocs(listings_dtm,"stay",corlimit = 0.80)
+
+print(assocs_stay$stay)
+```
+
+**results summary**
+
+- recommend
+
+|stay  |highly  |   helpful |  location  |    staying      |  perfect |       time  |
+|------|--------|----------|--------------|----------------|----------|-------------|
+|0.93   |     0.92|    0.88  |      0.85   |       0.85    |    0.84  |     0.84    |
+
+|clean   |  amazing| beautiful | wonderful |    comfortable|    day   |             |
+|-------|----------|-----------|-----------|---------------|----------|-------------|
+|0.83     |   0.81  |    0.81  |    0.81   |     0.80      |    0.80  |             | 
+
+- stay
+
+|recommend  | helpful   |   highly  |  location  |   perfect     |   time|       staying  |
+|-----------|--------|----------|--------------|----------------|----------|-------------|
+|0.93     |   0.90   |     0.88  |      0.87   |     0.86   |     0.86    |    0.85    |
+
+|clean  | wonderful | beautiful | comfortable |    amazing     |    day     |  loved   |
+|-------|----------|-----------|-----------|---------------|----------|----------------|
+|0.83     |   0.81  |    0.81  |    0.81   |     0.80      |    0.80  |          0.81  | 
+
+|helped  |         |           |           |             |             |           |
+|-----------|------|----------|------------|--------------|-----------|-----------|
+| 0.80   |          |        |            |               |             |         |
+
+
+```{r}
+# convert a list to dataframe first
+recommend_df <- data.frame(terms = names(assocs_recommend[[1]]), cor = assocs_recommend[[1]], stringsAsFactors =  F, row.names = NULL)
+stay_df <- data.frame(terms = names(assocs_stay[[1]]), cor = assocs_stay[[1]], stringsAsFactors =  F, row.names = NULL)
+
+# plot association
+r <- graph.data.frame(recommend_df, directed = TRUE)
+s <- graph.data.frame(stay_df, directed = TRUE)
+plot(r)
+plot(s)
+
+# another approach 
+# find associated terms using word_associate function
+# good visulisation at the same time  
+# but this takes time, so not recommended for the whole data
+# can be useful when investigate a certain listings' reviews
+
+# this is just example
+this_listing_reviews <- all_data %>% 
+  select(listing_id, comments) %>% 
+  filter(listing_id == 13131)
+
+assocs_recommend_2 <- word_associate(this_listing_reviews$comments, this_listing_reviews$listing_id, match.string = "recommend", wordcloud = T)
+
+assocs_stay_2 <- word_associate(this_listing_reviews$comments, this_listing_reviews$listing_id, match.string = "stay", wordcloud = T)
+
+```
+
+We also tried to use ngram model to find the most common word combinations used to describe a property listing. 
+
+```{r}
+# remove na
+text <- na.omit(all_data$comments)
+  
+# tokenize bigrams and trigrams 
+ngrams <- tokenize_ngrams(text, n = 3L, n_min = 2L, stopwords = stop_words$word) %>%
+  unlist()
+
+# make dataframe with ngrams vector and count the frequency of each word combination
+ngrams_df <- data.frame(ngrams = ngrams, stringsAsFactors = F) %>%
+  count(ngrams, sort = T)
+
+# see the top 10 word combinations
+ngrams_df %>% top_n(10)
+```
+
+**results summary**
+
+|ngrams |  n  |
+|-------|-----|
+|highly recommend	|15877	|		
+|walking distance	|8180	|		
+|minute walk|	6740			|
+|recommend staying|	4695|			
+|enjoyed stay	|4666			|
+|highly recommended|	4448|			
+|perfect location	|4407|			
+|î î	|4241			|
+|location perfect|	4231	|		
+|short walk	|3970|
+
+## What variables can be extracted from the text that can be related with the rating score ?
+
+We first calculate the average review scores rating for each listing, and then assign them into two rating groups based on the ranking. After that we find top 10 of the most frequent words appeared in the two groups.
+
+```{r}
+rating_categories <- all_data %>% 
+  group_by(listing_id) %>% 
+  summarise(avg_rating = mean(review_scores_rating)) %>%
+  ungroup()
+
+# Lets find the levels that we want to aggregate the words 
+quantile(rating_categories$avg_rating)
+
+# now assign them in a rating group
+# top 25% (2) vs the rest (1)
+rating_categories$rating_category <- ifelse(rating_categories$avg_rating<99,1,2)
+
+ratings_categories_tokens <- tokens_comments %>% left_join(rating_categories) %>% 
+  group_by(rating_category,word) %>% summarise(total =sum(n))
+
+# for the rest
+ratings_categories_tokens %>% filter(rating_category==1) %>% arrange(desc(total)) %>% top_n(10)
+
+# for top 25%
+ratings_categories_tokens %>% filter(rating_category==2) %>% arrange(desc(total)) %>% top_n(10)
+
+rm(ratings_categories_tokens)
+```
+
+**results summary**
+
+|rating_category|  word|  total|
+|--------------|-------|-------|
+|1	          |stay	 |   58247		|
+|1          	|location	|37109|		
+|1	          |house	|34589		|
+|1	          |clean	|32240		|
+|1	          |nice	|31083		|
+|1	          |recommend	|30232|		
+|1	          |host	|28963		|
+|1	          |apartment	|26578|		
+|1          	| view	|26022		|
+|1	          |amazing	|25568	|
+
+
+|rating_category|  word|  total|
+|--------------|-------|-------|
+|2	             |stay	|25386		|
+|2	               |house	|18996		|
+|2	              | amazing	|14382		|
+|2	             |  recommend|	13681|		
+|2	            |   location	|13565	|	
+|2             |  	host	|13277		|
+|2             |  	beautiful|	12908		|
+|2              	|clean	|12821		|
+|2              	|perfect	|12448	|	
+|2              	|view	|12212	|
+
+### Is readability of the property description an important predictor of the satisfaction ratings?
+
+For this case, a regression model can be used to evaluate the predictability of individual ratings against the variables obtained from readability of the property description. 
+
+During the processing, we consider all descriptive columns as a property description and then calculate the readability of these description texts using a variety of computed indexes. When analyzing, we plot the relationship between these readability indexes and the satisfaction ratings separately first. After that, we implemeneted simple linear regression for statistical check to fit the positive correlation between the variables. Finally, we find that ARI, Flesch.PSK, Flesch.Kincaid, and Linsear.Write all show that more difficult readability ensures higher rating scores. However, meanWordSyllables can be non-siginificant feature to predict rating score.
+
+We also use formality function to provide another insight into how the text relates to the reader. The more formal the writing means the greater the distance between author and reader. 
+ 
+```{r }
+# we tried two options to interpret the proerty description
+# first option is treating "description" column as the only preperty description:
+# all_listings <- all_data %>% select(listing_id,description,price) %>% 
+#   unique(.)
+# second option is to consider all descripttive columns as a property description
+# we will show the second approach in the report
+
+# combine the textual description into one column first     
+# and then find distinct sentences in these text columns as for the same listing property
+all_data_df <- all_data %>% select(summary, space, description)
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+description_list <- foreach (i=1:nrow(all_data_df)) %dopar% {
+  
+  this_summary <- all_data_df$summary[i]
+  this_space <- all_data_df$space[i]
+  this_description <- all_data_df$description[i]
+  
+  combined <- c(this_summary,this_space, this_description)
+  combined <- combined[!duplicated(combined)]
+  
+  this_combined <- paste(combined ,collapse = " ")
+  
+  return(this_combined)
+}
+
+stopCluster(cl)
+rm(cl)
+
+combined_description <- unlist(description_list)
+rm(description_list, all_data_df)
+
+all_listings <- all_data %>% 
+  select(listing_id, neighborhood_overview, notes, host_about) %>%
+  mutate(description = combined_description) %>%
+  unite(col = description, c(description, neighborhood_overview, notes, host_about), sep = " ") %>% 
+  unique(.)
+
+```
+
+
+```{r}
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  library(tidytext)
+  library(dplyr)
+  library(tm)
+  library(quanteda)
+})
+
+readability_list <- foreach(i=1:nrow(all_listings)) %dopar% {
+  
+  this_text <- iconv(all_listings$description[i])
+  this_text <- removeNumbers(this_text)
+  this_text <- removePunctuation(this_text)
+  
+  tryCatch(
+    {
+      readability_h <- textstat_readability(this_text, "all")
+      },
+    error=function(e){
+      cat("Error parsing")
+    })
+  
+  if(!is.null(readability_h)){
+    readability_h$document <- all_listings$listing_id[i]
+  }
+  
+  return(readability_h)
+}
+
+stopCluster(cl)
+rm(cl)
+
+readability_all <- rbindlist(readability_list)
+readability_all <- readability_all %>% rename(listing_id = document)
+rm(readability_list)
+
+# back up
+backup(cityname, "readability_all", readability_all)
+
+## detail of the readability index we use
+
+# Automated Readability Index (Senter and Smith 1967) ARI
+# 0.5 ASL + 4.71 AWL - 21.34
+
+# "Flesch.PSK":
+# The Powers-Sumner-Kearl's Variation of Flesch Reading Ease Score (Powers, Sumner and Kearl, 1958).
+# (0.0078 * ASL) + (4.55 * Nsy / Nw) - 2.2029
+
+# "Flesch.Kincaid":
+# Flesch-Kincaid Readability Score (Flesch and Kincaid 1975).
+# 0.39 * ASL + 11.8 * (NSy /Nw) - 15.59
+
+# "Linsear.Write":
+# Linsear Write (Klare 1975).
+# [(100 - (100 * Nwless3sy / Nw)) + (3 * 100 * Nwmin3sy / Nw)] / (100 * Nst / Nw)
+# where n_{wsy<3} = Nwless3sy = the number of words with less than 3 syllables, and n_{wsy>=3} = Nwmin3sy = the number of words with 3-syllables or more. The scaling by 100 arises because the original Linsear.Write measure is based on just a sample of 100 words)
+```
+
+```{r }
+all_ratings_read <- rating_categories %>% 
+  left_join(readability_all)
+
+# if there is NA or 0 case, run this code
+# all_ratings_read <- all_ratings_read[complete.cases(all_ratings_read$avg_rating), ]
+# all_ratings_read <- all_ratings_read[which(is.finite(log(all_ratings_read$avg_rating))), ]
+
+# average rating score vs readability indicies
+ggplot(all_ratings_read,aes(x=meanSentenceLength,y=avg_rating))+geom_jitter()
+ggplot(all_ratings_read,aes(x=meanWordSyllables,y=avg_rating))+geom_jitter()
+ggplot(all_ratings_read,aes(x=ARI,y=avg_rating))+geom_jitter()
+ggplot(all_ratings_read,aes(x=Flesch.PSK,y=avg_rating))+geom_jitter()
+ggplot(all_ratings_read,aes(x=Flesch.Kincaid,y=avg_rating))+geom_jitter()
+ggplot(all_ratings_read,aes(x=Linsear.Write,y=avg_rating))+geom_jitter()
+
+# More complicated readability seems to lead to higher rating score
+# as it is difficult to find 
+# lower rating scores in higher index area (positive realationship)
+# we implemeneted simple linear regression for statistical check
+
+model1 <- lm(all_ratings_read$avg_rating~all_ratings_read$meanSentenceLength)
+model2 <- lm(all_ratings_read$avg_rating~all_ratings_read$meanWordSyllables)
+model3 <- lm(all_ratings_read$avg_rating~all_ratings_read$ARI)
+model4 <- lm(all_ratings_read$avg_rating~all_ratings_read$Flesch.PSK)
+model5 <- lm(all_ratings_read$avg_rating~all_ratings_read$Flesch.Kincaid)
+model6 <- lm(all_ratings_read$avg_rating~all_ratings_read$Linsear.Write)
+
+stargazer::stargazer(model1,model2,model3,model4,model5,model6,type = "text")
+
+# all p-values are significant except meanWordSyllables
+# which means that meanWordSyllables can be non-siginificant feature to predict rating score
+# other measures except meanWordSyllables show that 
+# more difficult readability ensures higher rating scores
+```
+
+```{r}
+# Formality assesment
+# this code takes time 
+form <- formality(all_listings$description, grouping.var = listing_id)
+
+all_ratings_form <- rating_categories %>% 
+  left_join(form$formality)
+
+model_form <- lm(all_ratings_form$avg_rating~all_ratings_form$formality)
+```
+
+### Is mentioning the name of the owner important?
+
+We need to assess the influence of whether the name of the owner is present in the review comments on the review score ratings. At first, we assign a binary variable about the host name mentioned, and then plot the relationship between these two variables, finally test whether the impact is significant or not using t-test. According to the output, we find that mentioning the host name in the reveiew significantly increases the rating scores (t = -36.548, p-value < 2.2e-16), and reviews with host names are expeected to give about 0.68064 higher rating score than those without host names.
+
+```{r }
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  library(dplyr)
+})
+
+# make empty column to be filled with binary data (mentioned (1) or not (0))
+all_data$host_name_mentioned <- NA
+
+host_name_mentioned_list <- foreach(i=1:nrow(all_data)) %dopar% {
+  
+  check_h <- as.numeric(grepl(all_data$host_name[i],
+                              all_data$comments[i],
+                              ignore.case = T))
+  return(check_h)
+}
+
+stopCluster(cl)
+rm(cl)
+
+all_data$host_name_mentioned <- unlist(host_name_mentioned_list)
+rm(host_name_mentioned_list)
+# if host name appears at the very start of the review
+# could be fake review
+
+# We check the influence on whether the name of 
+# the owner is present in the review using the rating 
+# For this we are going to add a binary 0,1 variable 
+
+# How does it look graphically 
+ggplot(subset(all_data,!is.na(host_name_mentioned)),aes(x=factor(host_name_mentioned),y=review_scores_rating))+geom_boxplot()
+
+t.test(all_data$review_scores_rating~factor(all_data$host_name_mentioned))
+
+# the graph and t-test result shows that mentioning the host name in the reveiew
+# significantly increase the rating scores (t = -36.548, p-value < 2.2e-16)
+# review with host name will give about 0.68064 higher rating score
+# than review without host name
+
+```
+
+## Using the textual description of the property supplied by the owner, how does this relate with the price that the property is listed for rent?
+
+Like the previous analysis, we need to estimate the predictability of listing price against the variables obtained from readability of the property description using a regression model. During the processing, we use log() function on the price to unify the impact of different currencies. After that, We implemeneted simple linear regression to check the correlation between the readability measures of these description texts and the rented price of these properties. All models show that the readability measures have significant impact on the price. Based on those description texts, extra meanSentenceLength will decrease price while extra meanWordSyllables will increase price. All the readability indexes except Linsear.Write show that those properties with higher price tend to have easier description readability.
+
+```{r }
+# prepare data for regression
+all_listings_read <- all_data %>% 
+  select(listing_id, price) %>% 
+  unique() %>%
+  left_join(readability_all)
+
+# For working with the price 
+# we need to parse it first as a numeric variable 
+
+all_listings_read$price <- as.numeric(gsub("\\$","",all_listings_read$price))
+
+# remove NA
+all_listings_read <- all_listings_read[complete.cases(all_listings_read$price), ]
+
+# remove price with 0 as log(0) will generate -Infinite
+all_listings_read <- all_listings_read[which(is.finite(log(all_listings_read$price))), ]
+
+# log transformation on price to make it linear
+model1 <- lm(log(all_listings_read$price)~all_listings_read$meanSentenceLength)
+model2 <- lm(log(all_listings_read$price)~all_listings_read$meanWordSyllables)
+model3 <- lm(log(all_listings_read$price)~all_listings_read$ARI)
+model4 <- lm(log(all_listings_read$price)~all_listings_read$Flesch.PSK)
+model5 <- lm(log(all_listings_read$price)~all_listings_read$Flesch.Kincaid)
+model6 <- lm(log(all_listings_read$price)~all_listings_read$Linsear.Write)
+
+stargazer::stargazer(model1,model2,model3,model4,model5,model6,type = "text")
+
+# all models show that the readability measures have significant impact on the price
+# Extra meanSentenceLength decreases price while extra meanWordSyllables increases price
+# all the readability index except Linsear.Write show that low index increase price
+# which means that higher price properties tend to have easier description readability
+```
+
+# PART B
+
+Sentiment analysis provides a way to understand the attitudes and opinions expressed about every listing. And for both cases, a regression model should be used to evaluate the predictability of individual ratings and listing prices against the sentiment obtained from the review comments. 
+
+Since we already have converted the text to the tidy format, we can examine the net sentiment across the most recent narrative of reviews using four general-purpose lexicons respectively. These approaches all clearly highlighted the difference between listings whose comments conveyed a much stronger positive sentiment than others. Aferwards we implemeneted simple linear regression to fit the relationship between the listing price and preceived reviews sentiment. These four different lexicons give similar results that listings with higher reviews satisfactions significantly have higher price.
+
+However, it doesn't look very convincining only analysing the most recent reviews to make the conclusion, and then we use the calendar data to calculate price and occupancy rate dependence on previous month reviews. Then we follow the same strategy as in the previous case, using four general-purpose lexicons to analyse average sentiment of reviews per listing_id per month_year respectively first. Furthermore, we need to calculate the lag of the sentiment, which can also be done by grouping based on listing_id and month_year. Finally, we applied linear regression model to evaluate the time-based relationship between review satisfaction VS price and review satisfaction VS occupancy rate. According to the output of these four lexicons, price and occupancy rate will both significantly increase based on the higher average previous month reviews sentiments, which means that more positive feedback will incent host to raise listing price and also lead to higher occupancy rate.
+
+What's more, by comparing the estimation results of regression models using these four lexicons, we can find that the Loughran is more appropriate for sentiment analysis of this city's airbnb listing review comments than others，because of the best fitting for the positive effects of previous reviews sentiment on recent listing price and occupancy rate.
+
+```{r analyzesentiment}
+
+# make distinct dataframe based on listing_id, description and price
+# so that there is no duplicate listing and price
+all_listings <- all_data %>% select(listing_id,description,price) %>% 
+  unique(.)
+
+# remove dollar sign in the price column
+listing_id_price <- all_listings %>% 
+  select(listing_id,price) %>% 
+  mutate(price = as.numeric(gsub("\\$","",price)))
+
+#bing
+tokens_comments %>% 
+  # count the number of negative and positive per reivew_id
+  inner_join(get_sentiments("bing")) %>% 
+  count(sentiment,listing_id) %>%
+  # column which does not have positive or negative will have NA value after spread
+  # specify missing values as 0
+  spread(sentiment,n, fill = 0) %>% 
+  # bing_liu_sentiment column represents polarity and strength 
+  # positive value - positive sentiment (good)
+  # negative value - negative sentiment (bad)
+  mutate(bing_liu_sentiment = positive-negative) %>% 
+  select(listing_id,bing_liu_sentiment) -> bing_liu_sentiment_listing
+
+# add price on sentiment dataset
+bing_liu_sentiment_listing <- bing_liu_sentiment_listing %>%
+  left_join(listing_id_price)
+
+#nrc
+tokens_comments %>% 
+  inner_join(get_sentiments("nrc")) %>% 
+  count(sentiment,listing_id) %>% 
+  spread(sentiment,n, fill = 0) -> emotions_nrc
+
+emotions_nrc <- emotions_nrc %>% 
+  left_join(listing_id_price) %>% 
+  mutate(sentiment_nrc = positive-negative)
+
+#afinn
+tokens_comments %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(listing_id) %>% 
+  summarise(sentiment_affin = sum(value)) -> sentiment_affin
+
+sentiment_affin <- sentiment_affin %>% 
+  left_join(listing_id_price)
+
+
+#loughran
+tokens_comments %>% 
+  inner_join(get_sentiments("loughran")) %>% 
+  count(sentiment,listing_id) %>% 
+  spread(sentiment, n, fill = 0) -> sentiments_loughran
+
+sentiments_loughran <- sentiments_loughran %>% 
+  left_join(listing_id_price) %>% 
+  mutate(sentiment_loughran = positive-negative) %>% 
+  select(listing_id,price,sentiment_loughran)
+
+
+#leftjoin
+all_together_sentiments <- bing_liu_sentiment_listing %>% 
+  left_join(emotions_nrc) %>%
+  left_join(sentiment_affin) %>%
+  left_join(sentiments_loughran) %>% 
+  na.omit()
+
+
+# relationship between review satisfaction and price
+# The output of regression models using four different lexicons all show that listings with higher reviews satisfactions significantly have higher price(p-value < 0.01). Among these results, the R square of regression model on listing price using Loughran lexicon to analyse the review sentiment is the highest , which illustrates that Loughran is more appropriate for sentiment analysis of this city's airbnb listing review comments.
+
+# Bing Liu
+model1 <- lm(log(price)~bing_liu_sentiment, data=all_together_sentiments)
+
+# NRC affection 
+model2 <- lm(log(price)~sentiment_nrc,data=all_together_sentiments)
+
+# Afinn 
+model3 <- lm(log(price)~sentiment_affin,data=all_together_sentiments)
+
+# Loughran
+model4 <- lm(log(price)~sentiment_loughran, data=all_together_sentiments)
+
+# compare these four dictionaries
+stargazer::stargazer(model1,model2,model3,model4,type = "text")
+```
+
+```{r calendar}
+airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb.sqlite")
+# create index for fast query
+res <- dbSendQuery(airbnb_db, "CREATE INDEX listing_id_calendar ON calendar (listing_id)")
+
+dbClearResult(res)
+dbDisconnect(airbnb_db)
+
+# all listing id required for retrieving calendar data
+listing_id <- unique(all_data$listing_id)
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+# prepare libraries required in the pre processing
+clusterEvalQ(cl, {
+  library(lubridate)
+  library(dplyr)
+  library(RSQLite)
+  library(DBI)
+})
+
+all_calendar_list <- foreach(i=1:length(listing_id)) %dopar% {
+  
+  # multiple access to database per worker (cluster)
+  airbnb_db <- dbConnect(RSQLite::SQLite(), "D:\\airbnb\\airbnb.sqlite")
+
+  # single listing_id data extracted per worker (cluster)
+  query_calendar <- paste0("SELECT listing_id, date, available, price FROM calendar WHERE listing_id == ", listing_id[i])
+  
+  # calendar data for a single listing id is fetched from database
+  this_calendar_data <- dbGetQuery(airbnb_db, query_calendar) %>%
+    unique()
+  
+  dbDisconnect(airbnb_db)
+  
+  this_calendar_data$price <- as.numeric(gsub("\\$","",this_calendar_data$price))
+  
+  # create the binary occupancy column based on available column
+  this_calendar_data$occupied <- ifelse(this_calendar_data$available=="t",1,0)
+  
+  # change the date column format
+  this_calendar_data$month_year <- 
+    format(as.Date(this_calendar_data$date), "%Y-%m")
+  
+  # obtain occupancy rate and average price by date (month-year)
+  this_calendar_data <- this_calendar_data %>% 
+    group_by(listing_id, month_year) %>% 
+    summarise(occupancy_rate = sum(occupied)/n(),
+              avgprice = mean(price,na.rm = T))
+  
+  return(this_calendar_data)
+}
+
+stopCluster(cl)
+rm(cl)
+
+all_calendar_data <- rbindlist(all_calendar_list)
+
+# backup
+backup(cityname, "all_calendar_data", all_calendar_data)
+```
+
+
+```{r sentimentprocess}
+
+# Tokenization for review level in order to calculate 
+# sentiment
+
+all_data %>% 
+  select(review_id,date,comments) -> reviews_only
+
+# split into chunks
+split_size <- 10000
+tokens_list <- split(reviews_only, 
+                     rep(1:ceiling(nrow(reviews_only)
+                                   /split_size), 
+                         each=split_size,
+                         length.out=nrow(reviews_only)))
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  library(tidytext)
+  library(dplyr)
+})
+
+tokens_comments_list <- foreach (i=1:length(tokens_list)) %dopar% {
+  
+  # tokenization
+  tokens_h <- tokens_list[[i]] %>% 
+    unnest_tokens(word,comments) %>%
+    count(word,review_id) %>%
+    anti_join(stop_words)
+   
+  return(tokens_h)
+}
+
+stopCluster(cl)
+rm(cl)
+
+review_tokens_all <- rbindlist(tokens_comments_list)
+
+rm(tokens_list, tokens_comments_list)
+gc()
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+# subset original vector of words 
+# to exclude words with non-ASCII character (non-english words)
+# this can cause duplicate rows by removing non-english words
+# e.g. adaâ	-> ada will become same with the word originally ada 
+# this could generate two duplicate ada rows with same review_id 
+comments_only_en <- parSapply(cl = cl, review_tokens_all$word, function(row) iconv(row, "latin1", "ASCII", sub=""))
+stopCluster(cl)
+review_tokens_all$word <- comments_only_en
+rm(comments_only_en)
+gc()
+
+reviews_tokenized <- reviews_tokenized %>% 
+  group_by(word, review_id) %>% 
+  summarise(n = sum(n)) %>% ungroup()
+
+# find out a word with repetitive characters or patterns of characters
+# e.g. aaaa or wowwowwowwow
+customstopwords_comments <- review_tokens_all$word[grepl("\\b(\\S+?)\\1\\1\\S*\\b", review_tokens_all$word)]
+
+# remove useless words
+review_tokens_all <- review_tokens_all %>% 
+  filter(word != "") %>%
+  filter(!word %in% customstopwords_comments)
+
+review_tokens_all <- review_tokens_all %>% 
+  bind_tf_idf(word,review_id,n)
+
+# calculate the token length and 
+# proceed with a left and right trim 
+review_tokens_all$word_length <- nchar(review_tokens_all$word)
+    
+View(review_tokens_all %>% group_by(word_length) %>% summarise(total =n()))
+
+review_tokens_all <- review_tokens_all %>% 
+filter(between(word_length,3,15))
+
+
+# backup
+backup(cityname, "review_tokens_all", review_tokens_all)
+```
+
+```{r sentimentreviewlevel}
+
+##Bing Liu
+# count the number of negative and positive per reivew_id
+# bing_liu_sentiment column represents polarity and strength 
+# positive value - positive sentiment (good) / negative value - negative sentiment (bad)
+review_tokens_all %>% inner_join(get_sentiments("bing")) %>%
+  count(sentiment,review_id) %>% spread(sentiment,n,fill = 0) %>%
+  mutate(bing_liu_sentiment = positive-negative) %>%
+  select(review_id,bing_liu_sentiment) -> bing_liu_sentiment_listing_reviews
+
+# prepare data to retrieve corresponding listing_id and date
+all_data %>% select(listing_id,review_id,date) -> to_join_sentiment
+
+# calculate average bing liu sentiment per listing_id per date (month_year)
+bing_liu_sentiment_listing_reviews %>% left_join(to_join_sentiment) %>% mutate(month_year = format(as.Date(date),"%Y-%m")) %>% group_by(listing_id,month_year) %>% summarise(avg_sentiment_bing_liu = mean(bing_liu_sentiment)) -> bing_liu_sentiment_listing_month_year
+
+# join caledar data obtained in the previous step 
+# to the data of average bing liu sentiment
+# the result contain the month_year of review and the avearage sentiment around that period
+# and also corresponding average price and occupancy rate in that period
+all_calendar_data %>% 
+  right_join(bing_liu_sentiment_listing_month_year) %>% na.omit() -> to_regress_sentiment_price_occ_bing
+
+
+# lag of the sentiment can be done 
+# by grouping based on listingid and month_year
+
+to_regress_sentiment_price_occ_bing %>% group_by(listing_id) %>% arrange(month_year) %>% mutate(lag_sentiment = lag(avg_sentiment_bing_liu))-> to_regress_sentiment_price_occ_bing
+
+
+# lag_sentiment is review sentiment from previous month
+# use this for time-based relationship 
+# between review satisfaction VS price
+# and review satisfaction VS occupancy rate
+# that is, how price and occupancy_rate changes according to previous month reviews
+# does price change according to the previous month reviews sentiments?
+# does occupancy rate change according to the previous month reviews sentiments?
+
+model_h_sentiment_bing <- lm(log(avgprice)~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_bing)
+model_h_occupancy_bing <- lm(occupancy_rate~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_bing)
+
+stargazer::stargazer(model_h_sentiment_bing,model_h_occupancy_bing,type="text")
+
+```
+
+```{r}
+# NRC affection
+review_tokens_all %>% inner_join(get_sentiments("nrc")) %>%
+  count(sentiment,review_id) %>% spread(sentiment,n,fill = 0) -> emotions_nrc_listing_reviews
+
+# nrc_sentiment column represents polarity and strength
+# summarise this as an average value per listing_id per month-year
+emotions_nrc_listing_reviews %>% 
+  left_join(to_join_sentiment) %>% 
+  mutate(nrc_sentiment = positive-negative) %>% 
+  mutate(month_year = format(as.Date(date),"%Y-%m")) %>% 
+  group_by(listing_id,month_year) %>% 
+  summarise(avg_sentiment_nrc = mean(nrc_sentiment)) -> nrc_sentiment_listing_month_year
+
+# add occupancy rate and average price data
+all_calendar_data %>% 
+  right_join(nrc_sentiment_listing_month_year) %>% na.omit() -> to_regress_sentiment_price_occ_nrc
+  
+# Ok now we have the dataframe to regress
+# We need also to calculate the lag of the 
+# sentiment. This can be done by grouping 
+# based on listingid and month_year
+
+to_regress_sentiment_price_occ_nrc %>% group_by(listing_id) %>% arrange(month_year) %>% mutate(lag_sentiment = lag(avg_sentiment_nrc)) -> to_regress_sentiment_price_occ_nrc
+
+
+model_h_sentiment_nrc <- lm(log(avgprice)~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_nrc)
+model_h_occupancy_nrc <- lm(occupancy_rate~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_nrc)
+
+stargazer::stargazer(model_h_sentiment_nrc,model_h_occupancy_nrc,type="text")
+
+```
+
+
+```{r}
+#Afinn
+review_tokens_all %>% inner_join(get_sentiments("afinn")) %>%
+  group_by(review_id) %>%
+  mutate(afinn_sentiment = sum(value)) %>%
+  select(review_id,afinn_sentiment) -> sentiment_affin_listing_reviews
+
+sentiment_affin_listing_reviews %>% left_join(to_join_sentiment) %>% 
+  mutate(month_year = format(as.Date(date),"%Y-%m")) %>% 
+  group_by(listing_id,month_year) %>% 
+  summarise(avg_sentiment_afinn = mean(afinn_sentiment)) -> afinn_sentiment_listing_month_year
+
+all_calendar_data %>% 
+  right_join(afinn_sentiment_listing_month_year) %>% na.omit() -> to_regress_sentiment_price_occ_afinn
+
+# Ok now we have the dataframe to regress
+# We need also to calculate the lag of the 
+# sentiment. This can be done by grouping 
+# based on listingid and month_year
+
+to_regress_sentiment_price_occ_afinn %>% 
+  group_by(listing_id) %>% 
+  arrange(month_year) %>%
+  mutate(lag_sentiment = lag(avg_sentiment_afinn)) ->
+to_regress_sentiment_price_occ_afinn
+
+
+model_h_sentiment_afinn <- lm(log(avgprice)~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_afinn)
+model_h_occupancy_afinn <- lm(occupancy_rate~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_afinn)
+
+stargazer::stargazer(model_h_sentiment_afinn,model_h_occupancy_afinn,type="text")
+
+```
+
+
+```{r}
+#Loughran
+
+review_tokens_all %>% inner_join(get_sentiments("loughran")) %>%
+  count(sentiment,review_id) %>% spread(sentiment,n,fill = 0) %>%
+  mutate(loughran_sentiment = positive-negative) %>%
+  select(review_id,loughran_sentiment) -> loughran_sentiment_listing_reviews
+
+loughran_sentiment_listing_reviews %>% left_join(to_join_sentiment) %>% mutate(month_year = format(as.Date(date),"%Y-%m")) %>% group_by(listing_id,month_year) %>% summarise(avg_sentiment_loughran = mean(loughran_sentiment)) -> loughran_sentiment_listing_month_year
+
+all_calendar_data %>% 
+  right_join(loughran_sentiment_listing_month_year) %>% na.omit() -> to_regress_sentiment_price_occ_loughran
+  
+
+# Ok now we have the dataframe to regress
+# We need also to calculate the lag of the 
+# sentiment. This can be done by grouping 
+# based on listingid and month_year
+
+to_regress_sentiment_price_occ_loughran %>% group_by(listing_id) %>% arrange(month_year) %>% mutate(lag_sentiment = lag(avg_sentiment_loughran))-> to_regress_sentiment_price_occ_loughran
+
+
+
+model_h_sentiment_loughran <- lm(log(avgprice)~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_loughran)
+model_h_occupancy_loughran <- lm(occupancy_rate~lag_sentiment,
+                             data =to_regress_sentiment_price_occ_loughran)
+
+stargazer::stargazer(model_h_sentiment_loughran,model_h_occupancy_loughran,type="text")
+
+```
+
+
+```{r}
+# compare these four dictionaries
+# The output of regression models using four different lexicons all show that listings with higher previous reviews satisfactions significantly have higher price and occupancy rate(p-value < 0.01) recently. 
+# Among these results, the R square of regression models on listing price and occupancy rate using Loughran lexicon to analyse the review sentiment are both the highest, which further illustrates that Loughran is more appropriate for sentiment analysis of this city's airbnb listing review comments.
+
+stargazer::stargazer(model_h_sentiment_bing,model_h_sentiment_nrc,model_h_sentiment_afinn,model_h_sentiment_loughran,type = "text")
+
+stargazer::stargazer(model_h_occupancy_bing,model_h_occupancy_nrc,model_h_occupancy_afinn,model_h_occupancy_loughran,type = "text")
+```
+
+# PART C
+
+## Data preparation for topic modelling
+
+```{r }
+# if all_data is required
+# all_data <- loaddf(cityname, "all_data")
+
+# We will build a topic model 
+# where the topic is dependent on the review score and the price
+
+# prepare required data for structural topic model (stm)
+data_for_stm <- all_data %>% 
+  select(review_id,comments, review_scores_rating,listing_id,price) %>% 
+  mutate(price = as.numeric(gsub("\\$","",price))) %>%
+  rename(text = comments) %>% 
+  na.omit()
+
+rm(all_data)
+gc()
+```
+
+```{r}
+# Tokenize before 
+# feeding them in udpipe 
+# saves a lot of time during processing
+data("stop_words")
+
+# We will tokenise the reviews before using udpipe annotation
+# otherwise the process will be very slow
+# if the data_for_stm is too big
+# it is better to use parallel processing introduced previously
+data_for_stm %>% select(review_id,text) %>% 
+  unnest_tokens(word,text) %>% 
+  anti_join(stop_words) %>% 
+  count(word,review_id) -> reviews_tokenized
+
+# let's process tokenized words
+# make clusters for parallel processing ont tokenised reviews
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+# subset original vector of words to exclude words with non-ASCII character (non-english words)
+# this can cause duplicate rows by removing non-english words
+# e.g. adaâ	-> ada will become same with the word originally ada 
+# this could generate two duplicate ada rows with same review_id 
+only_en <- parSapply(cl = cl, reviews_tokenized$word, function(row) iconv(row, "latin1", "ASCII", sub=""))
+stopCluster(cl)
+
+reviews_tokenized$word <- only_en
+
+reviews_tokenized <- reviews_tokenized %>% 
+  group_by(word, review_id) %>% 
+  summarise(n = sum(n)) %>% ungroup()
+
+rm(only_en)
+gc()
+
+# find out a word with repetitive characters or patterns of characters
+# e.g. aaaa or wowwowwowwow
+customstopwords <- reviews_tokenized$word[grepl("\\b(\\S+?)\\1\\1\\S*\\b", reviews_tokenized$word)]
+
+# remove useless words
+reviews_tokenized <- reviews_tokenized %>% 
+  filter(word != "") %>%
+  filter(!word %in% customstopwords)
+
+# as we did previously
+reviews_tokenized$word_length <- nchar(reviews_tokenized$word)
+
+# Remove those less than 3 chars and more than 14 characters
+reviews_tokenized %>% 
+  filter(word_length>=3 & word_length<15) -> reviews_tokenized
+
+# tf-idf weighting 
+# we can remove extremely rare and extremely common parts 
+reviews_tokenized <- reviews_tokenized %>% 
+  bind_tf_idf(word,review_id,n) %>% 
+  filter(between(tf_idf,0.1,0.8)) 
+
+# check whether there is duplicated row
+# with the combination of "word" and "review_id" column
+dup = reviews_tokenized[,c('word','review_id')]
+reviews_tokenized[duplicated(dup) | duplicated(dup, fromLast=TRUE),]
+rm(dup)
+
+# prepare udpipe model for annotation on token
+language <- udpipe_download_model(language="english",overwrite = F)
+ud_model <- udpipe_load_model(language$file_model)
+
+rm(language)
+gc()
+```
+
+```{r}
+# make clusters for udpipe parallel processing 
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+# prepare required libraries during the process
+clusterEvalQ(cl, {
+  library(dplyr)
+  library(udpipe)
+  library(data.table)
+})
+
+# set the adequate chunk size
+split_size <- 50000
+# find out necessary iteration times
+total_number_of_chunks <- ceiling(nrow(reviews_tokenized)/split_size)
+
+
+annotation_list <- foreach(i=1:total_number_of_chunks) %dopar% {
+  
+  # to allocate chunk cut for each worker
+  if (i == 1){
+    this_start_row <- i 
+    this_last_row <- i*split_size
+  } else {
+    this_start_row <- (i-1)*split_size+1
+    this_last_row <- i*split_size
+  }
+  
+  # annotation on the reviews tokens
+  annotated_review <- as.data.table(udpipe_annotate(ud_model, 
+                                     x = reviews_tokenized$word[this_start_row:this_last_row],
+                                     doc_id = reviews_tokenized$review_id[this_start_row:this_last_row]))
+
+  return(annotated_review)
+}
+
+stopCluster(cl)
+rm(cl)
+
+# make a annotated reviews dataframe
+annotated_reviews <- rbindlist(annotation_list)
+rm(annotation_list)
+gc()
+
+# back up
+backup(cityname, "annotated_reviews", annotated_reviews)
+```
+
+```{r}
+# extract required word type (upos) and lemmatized words
+# then rename the doc_id as review_id
+annotated_reviews <- annotated_reviews %>%
+  filter(upos %in% c("NOUN","ADJ","ADV")) %>%
+  select(doc_id,lemma) %>%
+  rename(review_id = doc_id)
+
+# put all lemmatized words together which have same review_id
+annotated_reviews <- annotated_reviews %>% group_by(review_id) %>%
+  summarise(annotated_comments = paste(lemma,collapse = " "))
+
+# change the datatype of the data_for_stm$review_id as a chracter for left_join
+data_for_stm$review_id <- as.character(data_for_stm$review_id)
+
+# now we have lemmatiezed words with the original data together by left join
+data_for_stm <- annotated_reviews %>% 
+  left_join(data_for_stm)
+
+# back up
+backup(cityname, "data_for_stm", data_for_stm)
+```
+
+Now data preparation for topic modelling has been finished. Using this data, we will find out the adequate size of the topics and what those topics are actually about by looking at some information of each topic. 
+
+```{r}
+# process annotated comments
+customstopwords <- c("aribnb", gsub("_", " ",cityname))
+processed_data <- textProcessor(data_for_stm$annotated_comments,
+                                metadata = data_for_stm,
+                                customstopwords = customstopwords,
+                                stem = F)
+
+# keep only the vocabulary that appears at the 1% of all documents
+# setting the threshold for this
+threshold <- round(1/100 * length(processed_data$documents),0)
+
+# prepare documents for structural topic model (stm)
+out <- prepDocuments(processed_data$documents,
+                     processed_data$vocab,
+                     processed_data$meta,
+                     lower.thresh = threshold)
+
+```
+
+```{r searchK}
+numtopics <- searchK(out$documents,out$vocab,K=seq(from=4, to=10,by=1))
+plot(numtopics)
+# back up
+save(numtopics, file = "numtopics.rda")
+
+# The held-out likelihood is highest between 6 and 8 
+# and the residuals are lowest around 9 
+# Semantic coherence is maximized when the most probable words
+# in a given topic frequently co-occur together
+# look at both semantic coherence and exclusivity of words to topics
+# semantic coherence increases when topic number moves from 7 to 8
+# while all other intervals show decreasing trend
+# so perhaps an adequate number of topics would be 8.
+```
+
+```{r stm}
+# prevalence =~ review_scores_rating + price
+# with K=10 and the topic-word probabilities 
+# to depend on price and review score rating
+
+airbnbfit <- stm(documents = out$documents,
+                 vocab = out$vocab,
+                 K = 0,
+                 prevalence =~ price+review_scores_rating,
+                 max.em.its = 75, 
+                 data = out$meta,
+                 reportevery=3,
+                 # gamma.prior = "L1",
+                 sigma.prior = 0.7,
+                 init.type = "Spectral")
+
+# Optimal number of topics = 44 if K = 0
+
+# visualise the topics
+topicQuality(airbnbfit, documents = out$documents)
+plot(airbnbfit,labeltype = "prob")
+
+
+# alternative stm K = 8
+airbnbfit_8 <- stm(documents = out$documents,
+                   vocab = out$vocab,
+                   K = 8,
+                   prevalence =~ price+review_scores_rating,
+                   max.em.its = 75,
+                   data = out$meta,
+                   reportevery=3,
+                   # gamma.prior = "L1",
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+
+# visualise the topics
+topicQuality(airbnbfit_8, documents = out$documents)
+plot(airbnbfit_8,labeltype = "prob")
+
+```
+
+```{r}
+# airbnbfit
+# topic summary and proportion (average theta)
+topic_summary <- summary(airbnbfit)
+topic_proportions <- colMeans(airbnbfit$theta)
+
+topic_labels <- paste0("topic_",1:44)
+table_towrite_labels <- data.frame()
+
+# make summary table for topic results
+for(i in 1:length(topic_summary$topicnums)){
+  
+  row_here <- tibble(topicnum= topic_summary$topicnums[i],
+                     topic_label = topic_labels[i],
+                     proportion = 100*round(topic_proportions[i],4),
+                     frex_words = paste(topic_summary$frex[i,1:7],
+                                        collapse = ", "))
+  table_towrite_labels <- rbind(row_here,table_towrite_labels)
+}
+
+table_towrite_labels %>% arrange(topicnum)
+```
+
+```{r}
+# cloud function to find out the dominant words in each topic
+for (i in 1:length(topic_summary$topicnums)) {
+  cloud(airbnbfit,topic = i, max.words = 15)
+}
+
+# have a look at the most representative text for each topic
+thoughts <- out$meta %>% select(review_id) %>% left_join(data_for_stm)
+for (i in 1:length(topic_summary$topicnums)) {
+  print(findThoughts(airbnbfit,texts = thoughts$text,topics=i,n=1))
+  print(findThoughts(airbnbfit,texts = thoughts$annotated_comments,topics=i,n=1))
+}
+
+# after analysing all the topic information
+# it is possible to retain some insights on each topic
+# topics can be labelled as follows
+# from topic 44 to topic 1
+topic_labels <- c("view", "hospitality experience", "transportation and transfer", "holiday",
+                  "Thira", "restaurant", "studio", "shops and stores nearby", 
+                  "accessibility", "staff (Praise)", "vacation with familiy and friend",
+                  "shower issue (hot water)", "Mykonos and Rhodes island", "scooter rental",
+                  "ferry (cruise)", "Oia", "Naxos, Paros and Milos island", "location",
+                  "bathroom", "morning", "about house", "breakfast", "night",
+                  "about flat", "Fira", "port", "distance", "service (positive)", 
+                  "Service (negative)", "general experience (host)", "beach", 
+                  "cave", "busy and crowded spot", "close to town", "special touch by host",
+                  "about listing space", "host (praise)", "luggage", "local mood",
+                  "about apartment", "quick response", "general experience (stay)",
+                  "airport", "air")
+
+table_towrite_labels$topic_label <- topic_labels
+
+# back up
+backup(cityname, "table_towrite_labels", table_towrite_labels)
+```
+
+However, it is highly difficult to distinguish and labelling some topics with 44 topics. This is because topic number is too large, so that exclusitivity of some words between topics become weak. As a result, some topics look duplicate and ambiguous on what those topics actually imply. In addition, dominant words and results of findthoughts function does not correspond in many topics, which makes the process of labelling highly confusing. Therefore, we decided to use 'airbnbfit_8' which is based on searchK result (i.e. topic number = 8) to obtain more clear insights between the topics. 
+
+```{r}
+# same procedure
+topic_summary <- summary(airbnbfit_8)
+topic_proportions <- colMeans(airbnbfit_8$theta)
+
+topic_labels <- paste0("topic_",1:8)
+table_towrite_labels_8 <- data.frame()
+
+# make summary table for topic results
+for(i in 1:length(topic_summary$topicnums)){
+  
+  row_here <- tibble(topicnum= topic_summary$topicnums[i],
+                     topic_label = topic_labels[i],
+                     proportion = 100*round(topic_proportions[i],4),
+                     frex_words = paste(topic_summary$frex[i,1:7],
+                                        collapse = ", "))
+  table_towrite_labels_8 <- rbind(row_here,table_towrite_labels_8)
+}
+
+table_towrite_labels_8 %>% arrange(topicnum)
+```
+
+```{r}
+# same procedure
+for (i in 1:length(topic_summary$topicnums)) {
+  cloud(airbnbfit_8,topic = i, max.words = 10)
+}
+
+for (i in 1:length(topic_summary$topicnums)) {
+  print(findThoughts(airbnbfit_8,texts = thoughts$text,topics=i,n=3))
+  print(findThoughts(airbnbfit_8,texts = thoughts$annotated_comments,topics=i,n=3))
+}
+
+# topic labels
+# according to the outcome above
+# from topic 8 to 1
+topic_labels_8 <- c("air_conditioning", "response_to_question", "transport", 
+                    "listing_and_host_praise", "bathroom", "location_restaurant_and_shops", 
+                    "location_centers_and_spots", "general_experience_while_staying")
+
+table_towrite_labels_8$topic_label <- topic_labels_8
+
+# back up
+backup(cityname, "table_towrite_labels_8", table_towrite_labels_8)
+```
+
+```{r }
+# estimate effect of review scores and price on the topics probability
+effects <- estimateEffect(~review_scores_rating+price,
+                          stmobj = airbnbfit_8,
+                          metadata = out$meta )
+```
+
+## the effects of review score on topic probability
+
+```{r}
+# Effect of review score on topic 
+# probability 
+plot(effects, covariate = "review_scores_rating",
+     topics = c(1:8),
+     model = airbnbfit_8, method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlab = "Low Rating ... High Rating",
+     xlim = c(-0.01,0.01),
+     main = "Marginal change on topic probabilities for low and high rating score",
+     custom.labels = rev(topic_labels_8),
+     labeltype = "custom")
+
+```
+
+Marginal rating score increases the probabilities of `response to question`, `general experience while staying` and `listing and host (Praise)` to appear. This result makes sense because most of reviews in these topics represent positive sentiments. On the other hand, marginal rating score seem to decreases rest of the topics' probabilities. Especially, topic about `transport` shows the most significant decrease in topic probability by additional rating score. That is, reviews with lower rating are most likely to talk about `transport`.
+
+## the effects of price on topic probability
+
+```{r topics and price}
+# Effect of price on topic 
+# probability treating price as 
+# a continuous variable.
+
+# Ploting each topic separately 
+# we can see that some of them increase 
+# substantially with the price
+max(out$meta$price)
+min(out$meta$price)
+
+# first plot
+for(i in 1:length(topic_labels)){
+  plot(effects, covariate = "price",
+       topics = i,
+       model = airbnbfit_8, method = "continuous",
+       # For this plotting we get the uper quantile
+       # and low quantile of the price 
+       xlab = "Price",
+       xlim = c(0,1000),
+       main = rev(topic_labels_8)[i],
+       printlegend = FALSE,
+       custom.labels =rev(topic_labels_8)[i],
+       labeltype = "custom")
+}
+
+# Lets also plot them as a contrast between 
+# the minimum and maximum price 
+# for that we need the margins of the upper and lower quantile
+margin1 <- as.numeric(quantile(out$meta$price)[2])
+margin2 <- as.numeric(quantile(out$meta$price)[4])
+
+# second plot
+plot(effects, covariate = "price",
+     topics = c(1:8),
+     model = airbnbfit_8, method = "difference",
+     cov.value1 = margin2, cov.value2 = margin1,
+     xlab = "Low Price ... High Price",
+     xlim = c(-0.06,0.06),
+     main = "Marginal change on topic probabilities for low and high price",
+     custom.labels = rev(topic_labels_8),
+     labeltype = "custom")
+
+```
+
+**summary of the plots**
+topics which seems more likely to appear with high price in the order of significance level
+
+- `general experience while staying`
+
+- `bathroom`
+
+topics which seems more likely to appear with low price in the order of significance level
+
+- `location (centers and spots)`
+
+- `response to question`
+
+- `location (restaurant and shops)`
+
+- `transport`
+
+- `air conditioning`
+
+- `listing and host (praise)`
+
+Topic `general experience while staying` shows the highest increase in topic probability for an extra price. Listings with higher price normally have better service and room condition. This common sense is assummed to affect the customers as most of the reviews in the topic are about positive experiences of staying. The other topics seem to have relatively similar marginal decrease in probabilities per extra price.
+
+## How much extra information do they explain
+
+```{r prepare data for regression}
+theta <- as.data.frame(airbnbfit_8$theta)
+colnames(theta) <- rev(topic_labels_8)
+
+for_regression <- cbind(out$meta,theta)
+
+# features to predict (PART A) 
+# readability (readability of the property description) 
+# host_name_mentioned (whether host name is mentioned or not in comment)
+# we will use these features to make a base line model
+# and add up the topics as am independent variables
+# to analyse the changes
+
+# readability is stored in database
+# if required
+# dbcheck(cityname)
+# readability_all <- loaddf(cityname, "readability_all")
+
+# data type change for join
+all_data$review_id <- as.character(all_data$review_id)
+
+for_regression <- for_regression %>%
+  left_join(readability_all) %>%
+  left_join(all_data[,c("review_id", "host_name_mentioned")])
+
+```
+
+```{r review_scores_rating}
+# top 4 topics for review scores rating
+# general_experience_while_staying / response_to_question / listing_and_host_praise / transport
+
+model1 <- lm(review_scores_rating~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned),
+             data=for_regression)
+
+model2 <- lm(review_scores_rating~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying,
+             data=for_regression)
+
+model3 <- lm(review_scores_rating~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying+
+               response_to_question,
+             data=for_regression)
+
+model4 <- lm(review_scores_rating~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying+
+               response_to_question+listing_and_host_praise,
+             data=for_regression)
+
+model5 <- lm(review_scores_rating~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying+
+               response_to_question+listing_and_host_praise+transport,
+             data=for_regression)
+
+# check linearity!
+library(lmtest)
+lrtest(model1,model2,model3,model4,model5)
+
+stargazer(model1,model2,model3,model4,model5, type = "text",header = FALSE,
+          star.cutoffs = c(0.05,0.01,0.001))
+
+```
+
+model1 represents the base model that we tested in part A. We added topics' theta values as new independent variables to see whether the topics can explain extra information on rating scores. We chose 4 topics which seem to have the most significant relationship with rating score during the previous topic anlysis. Firstly, all the independent variables have significant prediction power on rating score in the model5. In addition, it is clear that R2 and Adjusted R2 gradually increases from 0.021 to 0.223 by adding topics one by one. Therefore, this result indicates that all the 4 topics add extra predictibility on estimating rating score.
+
+```{r price}
+# top 4 topics for price
+# general_experience_while_staying / location_centers_and_spots / response_to_question /  location_restaurant_and_shops
+
+model1 <- lm(log(price)~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned),
+             data=for_regression)
+
+model2 <- lm(log(price)~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying,
+             data=for_regression)
+
+model3 <- lm(log(price)~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying+
+               location_centers_and_spots,
+             data=for_regression)
+
+model4 <- lm(log(price)~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying+
+               location_centers_and_spots+response_to_question,
+             data=for_regression)
+
+model5 <- lm(log(price)~meanSentenceLength+ARI+Flesch.PSK+Flesch.Kincaid+
+               Linsear.Write+factor(host_name_mentioned)+general_experience_while_staying+
+               location_centers_and_spots+response_to_question+location_restaurant_and_shops,
+             data=for_regression)
+
+# check linearity
+library(lmtest)
+lrtest(model1,model2,model3,model4,model5)
+
+
+stargazer(model1,model2,model3,model4,model5, type = "text",header = FALSE,
+          star.cutoffs = c(0.05,0.01,0.001))
+
+```
+
+We followed the same procedure in the previous chunk. model1 represents the base model that we tested in part A. We again chose 4 topics which seem to have the most significant relationship with price during the previous topic anlysis. Like the previous result, all the independent variables have significant prediction power on price in the model5. In addition, it is clear that R2 and Adjusted R2 gradually increases from 0.048 to 0.475 by adding topics one by one. Therefore, this result also indicates that all the 4 topics add extra predictibility on estimating rating score.
