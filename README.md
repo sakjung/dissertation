@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://upload.wikimedia.org/wikipedia/en/thumb/2/21/Warwick_Business_School_logo.svg/1200px-Warwick_Business_School_logo.svg.png" width="200" height="200" class="center" />
+  <img src="https://www.google.com/url?sa=i&url=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FWarwick_Business_School&psig=AOvVaw2qEVnD8kk8ZaQNDcTtRra-&ust=1628729051823000&source=images&cd=vfe&ved=0CAsQjRxqFwoTCKjyltfep_ICFQAAAAAdAAAAABAD" width="200" height="200" class="center" />
 </p>
 
 ## Discovering Company-Specific Key Risk and Success Factors of Music Streaming Subscription Management by Analysing App Store Reviews: A Case Study of Tidal Music Streaming Service
